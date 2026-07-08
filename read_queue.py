@@ -1049,7 +1049,8 @@ def queue_history():
         try:
             # 定義標籤軸（維持跟原本一樣的顯示格式，方便前端不用改）
             all_labels = []
-            ptr = cutoff.replace(minute=(cutoff.minute // interval_min) * interval_min, second=0, microsecond=0)
+            bucket_origin = cutoff.replace(minute=(cutoff.minute // interval_min) * interval_min, second=0, microsecond=0)
+            ptr = bucket_origin
             while ptr <= end_dt:
                 all_labels.append(ptr.strftime('%m-%d %H:%M'))
                 ptr += timedelta(minutes=interval_min)
@@ -1072,7 +1073,7 @@ def queue_history():
             """
             params = {
                 'interval': timedelta(minutes=interval_min),
-                'origin': cutoff,
+                'origin': bucket_origin,
                 'category': category,
                 'start': cutoff,
                 'end': end_dt,
@@ -1278,10 +1279,11 @@ def dashboard_data():
     category = request.args.get("category", "LotActions")
 
     all_labels = []
-    ptr = cutoff.replace(
+    bucket_origin = cutoff.replace(
         minute=(cutoff.minute // interval_min) * interval_min,
         second=0, microsecond=0
     )
+    ptr = bucket_origin
     while ptr <= now_dt:
         all_labels.append(ptr.strftime('%H:%M'))
         ptr += timedelta(minutes=interval_min)
@@ -1304,7 +1306,7 @@ def dashboard_data():
                     """,
                     {
                         'interval': timedelta(minutes=interval_min),
-                        'origin': cutoff,
+                        'origin': bucket_origin,
                         'category': category,
                         'start': cutoff,
                         'end': now_dt,
