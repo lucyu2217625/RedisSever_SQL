@@ -518,8 +518,10 @@ function renderChart(chartData) {
 // ── 資料更新 ──────────────────────────────────────────────────
 async function refresh() {
   const cat = document.getElementById('category-select').value;
+  const params = new URLSearchParams(window.location.search);
+  params.set('category', cat);
   try {
-    const res  = await fetch(`/dashboard_data?category=${cat}`);
+    const res  = await fetch(`/dashboard_data?${params.toString()}`);
     if (!res.ok) return;
     const data = await res.json();
 

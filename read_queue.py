@@ -1194,8 +1194,26 @@ def dashboard_data():
     """Dashboard 用的單一聚合 API，前端每 5 秒輪詢一次"""
     local_tz = timezone(timedelta(hours=8))
     now_dt   = datetime.now(tz=local_tz)
-    cutoff   = now_dt - timedelta(hours=6)   # 趨勢圖固定顯示最近 6 小時
-    interval_min = 30                         # 每 30 分鐘一個資料點
+    mode = request.args.get('mode', 'last')
+    if mode == 'range':
+        parsed_start = safe_parse_datetime(request.args.get('start_time', '').strip())
+        parsed_end = safe_parse_datetime(request.args.get('end_time', '').strip())
+        cutoff = parsed_start.replace(tzinfo=local_tz) if parsed_start else now_dt - timedelta(hours=6)
+        end_dt = parsed_end.replace(tzinfo=local_tz) if parsed_end else now_dt
+    else:
+        try:
+            hours = int(request.args.get('hours', 6))
+        except ValueError:
+            hours = 6
+        cutoff = now_dt - timedelta(hours=hours)
+        end_dt = now_dt
+
+    try:
+        interval_min = int(request.args.get('interval', 30))
+    except ValueError:
+        interval_min = 30
+    if interval_min not in [10, 30, 60]:
+        interval_min = 30
 
     # ── 1. Queue 長度 ──────────────────────────────────────────
     queue_stats = []
@@ -1209,10 +1227,7 @@ def dashboard_data():
         "prober_task_queue",
         "prober_failed_queue",
     ]
-    # 只取 ALLOWED_QUEUES 裡有的
     for q in monitored_queues:
-        if q not in ALLOWED_QUEUES:
-            continue
         try:
             q_type = redisConnect.redis_master.type(q)
             length = redisConnect.redis_master.llen(q) if q_type == 'list' else 0
@@ -1284,7 +1299,7 @@ def dashboard_data():
         second=0, microsecond=0
     )
     ptr = bucket_origin
-    while ptr <= now_dt:
+    while ptr <= end_dt:
         all_labels.append(ptr.strftime('%H:%M'))
         ptr += timedelta(minutes=interval_min)
 
@@ -1309,7 +1324,7 @@ def dashboard_data():
                         'origin': bucket_origin,
                         'category': category,
                         'start': cutoff,
-                        'end': now_dt,
+                        'end': end_dt,
                     }
                 )
                 for bucket_label, status, cnt in cur.fetchall():
