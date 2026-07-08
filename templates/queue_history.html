@@ -1,0 +1,225 @@
+{% extends "layout.html" %}
+
+{% block title %}任務趨勢 - Redis 佇列管理系統{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-4">
+    <h1 class="text-lg font-semibold text-gray-800">任務執行趨勢圖</h1>
+    <div class="flex items-center gap-3">
+        <div class="flex items-center gap-1.5 text-xs text-gray-400">
+            <span class="w-3 h-0.5 bg-blue-500 rounded"></span> 成功
+        </div>
+        <div class="flex items-center gap-1.5 text-xs text-gray-400">
+            <span class="w-3 h-0.5 bg-red-400 rounded"></span> 失敗
+        </div>
+    </div>
+</div>
+
+<!-- 篩選控制卡片 -->
+<div class="card p-4 mb-6">
+    <form method="GET" action="{{ url_for('queue_history') }}" class="flex flex-wrap items-end gap-4">
+        <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-gray-500">類別</label>
+            <select name="category" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                {% for cat in available_categories %}
+                <option value="{{ cat }}" {% if cat == category %}selected{% endif %}>{{ cat }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-gray-500">時間模式</label>
+            <select name="mode" id="time_mode" onchange="toggleTimeMode()" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                <option value="last" {% if mode == 'last' %}selected{% endif %}>最近時段</option>
+                <option value="range" {% if mode == 'range' %}selected{% endif %}>自訂區間</option>
+            </select>
+        </div>
+
+        <div id="mode_last" class="{% if mode != 'last' %}hidden{% endif %} flex items-end gap-4">
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-medium text-gray-500">最近小時</label>
+                <select name="hours" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                    {% for h in [1, 3, 6, 12, 24, 48, 72] %}
+                    <option value="{{ h }}" {% if h == hours %}selected{% endif %}>最近 {{ h }} 小時</option>
+                    {% endfor %}
+                </select>
+            </div>
+        </div>
+
+        <div id="mode_range" class="{% if mode != 'range' %}hidden{% endif %} flex flex-wrap items-end gap-4">
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-medium text-gray-500">開始時間</label>
+                <input type="datetime-local" name="start_time" value="{{ start_time }}" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+            </div>
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-medium text-gray-500">結束時間</label>
+                <input type="datetime-local" name="end_time" value="{{ end_time }}" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+            </div>
+        </div>
+
+        <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-gray-500">間隔 (分)</label>
+            <select name="interval" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                {% for m in [10, 30, 60] %}
+                <option value="{{ m }}" {% if m == interval %}selected{% endif %}>{{ m }} 分鐘</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-gray-500">Worker 篩選</label>
+            <select name="worker_name" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                <option value="">-- 全部 --</option>
+                {% for w in sorted_workers %}
+                <option value="{{ w }}" {% if w == worker_name_filter %}selected{% endif %}>{{ w }}</option>
+                {% endfor %}
+            </select>
+        </div>
+
+        <button type="submit" class="btn-primary">
+            <i class="fas fa-sync-alt"></i> 更新圖表
+        </button>
+    </form>
+</div>
+
+<!-- 統計摘要 -->
+<div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-6">
+    <div class="card p-4 flex items-center gap-4">
+        <div class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-600">
+            <i class="fas fa-check-circle"></i>
+        </div>
+        <div>
+            <p class="text-xs text-gray-500 font-medium">區間成功總計</p>
+            <p class="text-xl font-bold text-gray-800" id="stat-dispatched">{{ total_dispatched }}</p>
+        </div>
+    </div>
+    <div class="card p-4 flex items-center gap-4">
+        <div class="w-10 h-10 rounded-full bg-red-50 flex items-center justify-center text-red-600">
+            <i class="fas fa-times-circle"></i>
+        </div>
+        <div>
+            <p class="text-xs text-gray-500 font-medium">區間失敗總計</p>
+            <p class="text-xl font-bold text-gray-800" id="stat-failed">{{ total_failed }}</p>
+        </div>
+    </div>
+</div>
+
+<!-- 圖表卡片 -->
+<div class="card p-6">
+    <div style="position: relative; height:400px; width:100%">
+        <canvas id="historyChart"></canvas>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    let myChart = null;
+
+    function toggleTimeMode() {
+        const mode = document.getElementById('time_mode').value;
+        document.getElementById('mode_last').classList.toggle('hidden', mode !== 'last');
+        document.getElementById('mode_range').classList.toggle('hidden', mode !== 'range');
+    }
+
+    function initChart(data) {
+        const ctx = document.getElementById('historyChart').getContext('2d');
+        if (myChart) myChart.destroy();
+
+        myChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: data.labels,
+                datasets: [
+                    {
+                        label: '成功任務',
+                        data: data.counts_dispatched,
+                        borderColor: '#3b82f6',
+                        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 3,
+                        pointHoverRadius: 5
+                    },
+                    {
+                        label: '失敗任務',
+                        data: data.counts_failed,
+                        borderColor: '#f87171',
+                        backgroundColor: 'rgba(248, 113, 113, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 3,
+                        pointHoverRadius: 5
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {
+                    mode: 'index',
+                    intersect: false
+                },
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    tooltip: {
+                        padding: 12,
+                        backgroundColor: 'rgba(255, 255, 255, 0.9)',
+                        titleColor: '#1f2937',
+                        bodyColor: '#4b5563',
+                        borderColor: '#e5e7eb',
+                        borderWidth: 1,
+                        boxPadding: 6,
+                        usePointStyle: true
+                    }
+                },
+                scales: {
+                    x: {
+                        grid: { display: false },
+                        ticks: { color: '#9ca3af', font: { size: 11 } }
+                    },
+                    y: {
+                        beginAtZero: true,
+                        grid: { color: '#f3f4f6' },
+                        ticks: { color: '#9ca3af', font: { size: 11 }, stepSize: 1 }
+                    }
+                }
+            }
+        });
+    }
+
+    async function updateData() {
+        const params = new URLSearchParams(window.location.search);
+        try {
+            const response = await fetch(`${window.location.pathname}?${params.toString()}`, {
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            });
+            const data = await response.json();
+            if (data.chart_data) {
+                initChart(data.chart_data);
+                document.getElementById('stat-dispatched').textContent = data.total_dispatched;
+                document.getElementById('stat-failed').textContent = data.total_failed;
+            }
+        } catch (error) {
+            console.error('更新圖表失敗:', error);
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        const chartData = {{ chart_data | tojson | safe if chart_data else 'null' }};
+        if (chartData) {
+            initChart(chartData);
+        }
+        
+        // 如果是 "最近時段" 模式，開啟自動更新
+        const mode = document.getElementById('time_mode').value;
+        if (mode === 'last') {
+            setInterval(updateData, 30000); // 每 30 秒更新一次
+        }
+    });
+</script>
+{% endblock %}

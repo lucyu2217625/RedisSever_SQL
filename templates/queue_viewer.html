@@ -1,0 +1,343 @@
+{% extends "layout.html" %}
+
+{% block title %}Queue 查詢 - Redis 佇列管理系統{% endblock %}
+
+{% block head %}
+<style>
+    .status-btn-busy { background-color: #dc2626; color: #fff; border-color: #dc2626; }
+    .status-btn-busy:hover { background-color: #b91c1c; border-color: #b91c1c; }
+    .status-btn-idle { background-color: #ecfdf5; color: #047857; border-color: #a7f3d0; }
+    .status-btn-idle:hover { background-color: #d1fae5; border-color: #6ee7b7; }
+    .status-btn-offline { background-color: #f3f4f6; color: #4b5563; border-color: #d1d5db; }
+    .status-btn-offline:hover { background-color: #e5e7eb; border-color: #9ca3af; }
+    .status-btn-unknown { background-color: #fffbeb; color: #b45309; border-color: #fde68a; }
+    .status-btn-unknown:hover { background-color: #fef3c7; border-color: #fcd34d; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-4">
+    <h1 class="text-lg font-semibold text-gray-800">Queue 內容查詢</h1>
+    <div class="text-xs text-gray-500 font-mono bg-white px-3 py-1 rounded-full border border-gray-200">
+        {{ queue_name if queue_name else "請選擇佇列" }}
+    </div>
+</div>
+
+<div class="grid grid-cols-1 gap-6">
+    <!-- 查詢控制卡片 -->
+    <div class="card p-4">
+        <form method="POST" action="{{ url_for('index') }}" class="flex flex-wrap items-end gap-4">
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-medium text-gray-500">選擇佇列</label>
+                <select name="queue_name" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none min-w-[200px]">
+                    <option value="">-- 請選擇 --</option>
+                    
+                    <optgroup label="LotActions">
+                        {% for q in available_queues if q.startswith('LotActions_') or q.startswith('LotAction_') %}
+                        <option value="{{ q }}" {% if q == queue_name %}selected{% endif %}>{{ q }}</option>
+                        {% endfor %}
+                    </optgroup>
+
+                    <optgroup label="LineNotify">
+                        {% for q in available_queues if q.startswith('LineNotify') %}
+                        <option value="{{ q }}" {% if q == queue_name %}selected{% endif %}>{{ q }}</option>
+                        {% endfor %}
+                    </optgroup>
+
+                    <optgroup label="Prober">
+                        {% for q in available_queues if q.startswith('prober') %}
+                        <option value="{{ q }}" {% if q == queue_name %}selected{% endif %}>{{ q }}</option>
+                        {% endfor %}
+                    </optgroup>
+
+                    <optgroup label="其他">
+                        {% for q in available_queues %}
+                            {% if not (q.startswith('LotActions_') or q.startswith('LotAction_') or q.startswith('LineNotify') or q.startswith('prober')) %}
+                            <option value="{{ q }}" {% if q == queue_name %}selected{% endif %}>{{ q }}</option>
+                            {% endif %}
+                        {% endfor %}
+                    </optgroup>
+                </select>
+            </div>
+            
+            <div class="flex flex-col gap-1">
+                <label class="text-xs font-medium text-gray-500">每頁顯示</label>
+                <select name="per_page" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                    {% for n in [10, 25, 50, 100] %}
+                    <option value="{{ n }}" {% if n == per_page %}selected{% endif %}>{{ n }} 筆</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <button type="submit" class="btn-primary">
+                <i class="fas fa-search"></i> 查詢
+            </button>
+
+            {% if queue_name %}
+            <a href="{{ url_for('download', queue_name=queue_name) }}" class="btn-secondary">
+                <i class="fas fa-download"></i> 下載 JSON
+            </a>
+            {% endif %}
+        </form>
+    </div>
+
+    {% if error %}
+    <div class="bg-amber-50 border border-amber-200 text-amber-800 p-4 rounded-xl text-sm flex items-center gap-3">
+        <i class="fas fa-exclamation-triangle text-amber-500"></i>
+        {{ error }}
+    </div>
+    {% endif %}
+
+    {% if queue_name and not error %}
+    <!-- 資料列表卡片 -->
+    <div class="card overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200 flex justify-between items-center">
+            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                總計 {{ queue_length }} 筆資料
+            </span>
+            {% set is_worker_status_queue = is_hash and 'worker_status' in queue_name %}
+            {% if user_role == 'admin' and is_worker_status_queue %}
+            <button type="button" id="toggle-status-edit-btn" onclick="toggleStatusEdit()" class="btn-secondary btn-sm">
+                <i class="fas fa-pen mr-1"></i>編輯狀態
+            </button>
+            {% elif user_role == 'admin' %}
+            <div id="delete-init-container">
+                <button type="button" onclick="showDeleteActions()" class="btn-danger-subtle btn-sm">
+                    <i class="fas fa-trash-alt mr-1"></i>刪除
+                </button>
+            </div>
+            <div id="delete-actions-container" class="hidden flex gap-3">
+                <button type="button" onclick="confirmClear()" class="btn-danger-subtle btn-sm">
+                    <i class="fas fa-fire mr-1"></i>清空全部
+                </button>
+                <button type="button" onclick="submitDeleteSelected()" class="btn-danger btn-sm">
+                    <i class="fas fa-check-square mr-1"></i>刪除所選
+                </button>
+                <button type="button" onclick="cancelDelete()" class="btn-ghost btn-sm">
+                    取消
+                </button>
+            </div>
+            {% endif %}
+        </div>
+
+        <form id="{% if is_worker_status_queue %}status-form{% else %}delete-form{% endif %}"
+              method="POST"
+              action="{% if is_worker_status_queue %}{{ url_for('update_status') }}{% else %}{{ url_for('delete_selected') }}{% endif %}">
+            <input type="hidden" name="queue_name" value="{{ queue_name }}">
+            {% if not is_worker_status_queue %}
+            <input type="hidden" name="delete_all_force" id="delete_all_force" value="0">
+            {% endif %}
+            
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="bg-white border-b border-gray-100 text-xs font-semibold text-gray-600">
+                            {% if user_role == 'admin' and not is_worker_status_queue %}
+                            <th class="p-4 w-10 delete-checkbox hidden">
+                                <input type="checkbox" onclick="toggleAll(this)" class="rounded text-blue-600 focus:ring-blue-500">
+                            </th>
+                            {% endif %}
+                            <th class="p-4 w-12 text-center">#</th>
+                            <th class="p-4">內容 (JSON / 原文)</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-gray-50">
+                        {% if is_hash %}
+                            {% for key, status in hash_data.items() %}
+                            <tr class="hover:bg-gray-50 transition-colors">
+                                {% if user_role == 'admin' and not is_worker_status_queue %}
+                                <td class="p-4 delete-checkbox hidden">
+                                    <input type="checkbox" name="selected_items[]" value="{{ key }}" class="rounded text-blue-600 focus:ring-blue-500">
+                                </td>
+                                {% endif %}
+                                <td class="p-4 text-xs font-mono text-gray-400 text-center">
+                                    {{ loop.index }}
+                                </td>
+                                <td class="p-4">
+                                    <div class="flex items-center justify-between">
+                                        <span class="font-mono text-sm text-gray-900 bg-gray-50 px-2 py-0.5 rounded">{{ key }}</span>
+                                        {% if is_worker_status_queue and user_role == 'admin' %}
+                                        <span class="status-cell" data-key="{{ key }}" data-status="{{ status }}">
+                                            <span class="status-label text-sm {% if status == 'busy' %}text-red-600{% elif status == 'idle' %}text-green-600{% elif status == 'offline' %}text-gray-500{% else %}text-amber-600{% endif %} font-medium">
+                                                {{ status }}
+                                            </span>
+                                            <input type="hidden" name="status_{{ key }}" value="{{ status }}">
+                                        </span>
+                                        {% else %}
+                                        <span class="text-sm {% if status == 'busy' %}text-red-600{% elif status == 'idle' %}text-green-600{% else %}text-gray-500{% endif %} font-medium">
+                                            {{ status }}
+                                        </span>
+                                        {% endif %}
+                                    </div>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% else %}
+                            {% for item in queue_data %}
+                            <tr class="hover:bg-gray-50 transition-colors">
+                                {% if user_role == 'admin' %}
+                                <td class="p-4 delete-checkbox hidden">
+                                    <input type="checkbox" name="selected_items[]" value="{{ item.raw }}" class="rounded text-blue-600 focus:ring-blue-500">
+                                </td>
+                                {% endif %}
+                                <td class="p-4 text-xs font-mono text-gray-400 text-center">
+                                    {{ loop.index + (page - 1) * per_page }}
+                                </td>
+                                <td class="p-4">
+                                    <pre class="text-xs font-mono text-gray-700 bg-gray-50 p-3 rounded-lg overflow-x-auto max-h-40">{{ item.parsed | tojson(indent=2) if item.parsed is mapping else item.raw }}</pre>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </form>
+
+        <!-- 分頁 -->
+        {% if total_pages > 1 %}
+        <div class="px-4 py-3 bg-white border-t border-gray-200 flex items-center justify-between">
+            <div class="flex items-center gap-4">
+                <div class="text-xs text-gray-500">
+                    共 {{ total_pages }} 頁 / {{ queue_length }} 筆資料
+                </div>
+                <div class="flex items-center gap-2">
+                    <label class="text-xs text-gray-500">跳至第</label>
+                    <select onchange="window.location.href='{{ url_for('index', queue_name=queue_name, per_page=per_page) }}&page=' + this.value" 
+                            class="text-xs border border-gray-300 rounded px-2 py-1 outline-none focus:ring-1 focus:ring-blue-400 bg-white cursor-pointer">
+                        {% for p in range(1, total_pages + 1) %}
+                        <option value="{{ p }}" {% if p == page %}selected{% endif %}>{{ p }}</option>
+                        {% endfor %}
+                    </select>
+                    <label class="text-xs text-gray-500">頁</label>
+                </div>
+            </div>
+            <div class="flex gap-1">
+                {% if page > 1 %}
+                <a href="{{ url_for('index', queue_name=queue_name, page=page-1, per_page=per_page) }}" class="btn-secondary btn-sm">
+                    <i class="fas fa-chevron-left"></i> 上一頁
+                </a>
+                {% endif %}
+                
+                {% if page < total_pages %}
+                <a href="{{ url_for('index', queue_name=queue_name, page=page+1, per_page=per_page) }}" class="btn-secondary btn-sm">
+                    下一頁 <i class="fas fa-chevron-right"></i>
+                </a>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let isStatusEditing = false;
+
+function statusBadgeClass(status) {
+    if (status === 'busy') return 'btn-secondary btn-sm status-btn-busy';
+    if (status === 'idle') return 'btn-secondary btn-sm status-btn-idle';
+    if (status === 'offline') return 'btn-secondary btn-sm status-btn-offline';
+    return 'btn-secondary btn-sm status-btn-unknown';
+}
+
+function nextStatus(status) {
+    if (status === 'busy') return 'idle';
+    if (status === 'idle') return 'offline';
+    return 'busy';
+}
+
+function toggleStatusEdit() {
+    const form = document.getElementById('status-form');
+    const toggleBtn = document.getElementById('toggle-status-edit-btn');
+    if (!form || !toggleBtn) return;
+
+    isStatusEditing = !isStatusEditing;
+
+    if (!isStatusEditing) {
+        form.submit();
+        return;
+    }
+
+    toggleBtn.innerHTML = '<i class="fas fa-save mr-1"></i>儲存狀態';
+    toggleBtn.className = 'btn-primary btn-sm';
+
+    document.querySelectorAll('.status-cell').forEach(cell => {
+        const currentValue = cell.getAttribute('data-status');
+        const input = cell.querySelector('input[type="hidden"]');
+        const label = cell.querySelector('.status-label');
+        if (!label || !input) return;
+
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = currentValue;
+        button.className = statusBadgeClass(currentValue);
+        button.onclick = () => {
+            const newValue = nextStatus(button.textContent.trim());
+            button.textContent = newValue;
+            button.className = statusBadgeClass(newValue);
+            input.value = newValue;
+            cell.setAttribute('data-status', newValue);
+        };
+
+        label.replaceWith(button);
+    });
+}
+
+function showDeleteActions() {
+    document.getElementById('delete-init-container').classList.add('hidden');
+    document.getElementById('delete-actions-container').classList.remove('hidden');
+    
+    const checkboxes = document.querySelectorAll('.delete-checkbox');
+    checkboxes.forEach(el => el.classList.remove('hidden'));
+}
+
+function cancelDelete() {
+    document.getElementById('delete-init-container').classList.remove('hidden');
+    document.getElementById('delete-actions-container').classList.add('hidden');
+    
+    const checkboxes = document.querySelectorAll('.delete-checkbox');
+    checkboxes.forEach(el => el.classList.add('hidden'));
+    
+    // 取消所有已勾選的項
+    const inputs = document.getElementsByName('selected_items[]');
+    inputs.forEach(i => i.checked = false);
+    const toggle = document.querySelector('thead .delete-checkbox input');
+    if (toggle) toggle.checked = false;
+}
+
+function submitDeleteSelected() {
+    const checkboxes = document.getElementsByName('selected_items[]');
+    let checkedCount = 0;
+    for (let i = 0; i < checkboxes.length; i++) {
+        if (checkboxes[i].checked) checkedCount++;
+    }
+    
+    if (checkedCount === 0) {
+        alert('請先勾選要刪除的項目');
+        return;
+    }
+    
+    if (confirm(`確定要刪除選中的 ${checkedCount} 筆項目嗎？`)) {
+        document.getElementById('delete_all_force').value = '0';
+        document.getElementById('delete-form').submit();
+    }
+}
+
+function toggleAll(source) {
+    const checkboxes = document.getElementsByName('selected_items[]');
+    for (let i = 0; i < checkboxes.length; i++) {
+        checkboxes[i].checked = source.checked;
+    }
+}
+
+function confirmClear() {
+    if (confirm('確定要清空整個佇列「{{ queue_name }}」嗎？此操作無法復原。')) {
+        document.getElementById('delete_all_force').value = '1';
+        document.getElementById('delete-form').submit();
+    }
+}
+</script>
+{% endblock %}

@@ -1,0 +1,136 @@
+{% extends "layout.html" %}
+
+{% block title %}API 測試 - Redis 佇列管理系統{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto">
+    <div class="flex items-center justify-between mb-6">
+        <h1 class="text-lg font-semibold text-gray-800">AMR API Trigger Test</h1>
+    </div>
+
+    <!-- 測試表單 -->
+    <div class="bg-white shadow-lg rounded-xl p-8 mb-8 border border-gray-100">
+        <form method="POST" action="{{ url_for('api_trigger') }}" class="space-y-6">
+            
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- 端點選擇 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">API endpoint</label>
+                    <select name="endpoint" id="endpoint" onchange="updateFields()" class="w-full border-gray-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2.5 border">
+                        <option value="/EQPAction" {% if endpoint == '/EQPAction' %}selected{% endif %}>/EQPAction</option>
+                        <option value="/EQPAction_DataEntry" {% if endpoint == '/EQPAction_DataEntry' %}selected{% endif %}>/EQPAction_DataEntry</option>
+                        <option value="/Prober" {% if endpoint == '/Prober' %}selected{% endif %}>/Prober</option>
+                        <option value="/ContactInquiry" {% if endpoint == '/ContactInquiry' %}selected{% endif %}>/ContactInquiry</option>
+                    </select>
+                </div>
+
+                <!-- 機台輸入 -->
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 mb-2">EQPID</label>
+                    <input type="text" name="eqpid" required list="eqp-list" value="{{ last_payload.EQPID if last_payload else '' }}" 
+                           class="w-full border-gray-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2.5 border" 
+                           placeholder="輸入或選擇機台...">
+                    <datalist id="eqp-list">
+                        {% for eqp in eqp_list %}
+                            <option value="{{ eqp }}">
+                        {% endfor %}
+                    </datalist>
+                </div>
+            </div>
+
+            <!-- 動作輸入 -->
+            <div id="action-group">
+                <label id="action-label" class="block text-sm font-medium text-gray-700 mb-2">Action</label>
+                <input type="text" name="action" list="action-list" value="{{ last_payload.Action if last_payload else 'LotEnd' }}" 
+                       class="w-full border-gray-300 rounded-lg shadow-sm focus:border-blue-500 focus:ring-blue-500 p-2.5 border" 
+                       placeholder="輸入或選擇動作...">
+                <datalist id="action-list">
+                    <option value="LotStart">
+                    <option value="LotEnd">
+                    <option value="Error">
+                    <option value="Warning">
+                </datalist>
+            </div>
+
+            <!-- DataEntry 額外欄位 -->
+            <div id="data-entry-fields" class="{% if endpoint != '/EQPAction_DataEntry' %}hidden{% endif %} space-y-4 p-4 bg-blue-50 rounded-lg border border-blue-100">
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div>
+                        <label class="block text-xs font-bold text-blue-700 uppercase mb-1">Tester Input</label>
+                        <input type="text" name="tester_input" value="{{ last_payload.TesterInput if last_payload else '' }}" class="w-full border-gray-300 rounded shadow-sm p-2 text-sm border">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-blue-700 uppercase mb-1">Prober Input</label>
+                        <input type="text" name="prober_input" value="{{ last_payload.ProberInput if last_payload else '' }}" class="w-full border-gray-300 rounded shadow-sm p-2 text-sm border">
+                    </div>
+                    <div>
+                        <label class="block text-xs font-bold text-blue-700 uppercase mb-1">Mode</label>
+                        <input type="text" name="mode" list="mode-list" value="{{ last_payload.Mode if last_payload else 'Auto' }}" 
+                               class="w-full border-gray-300 rounded shadow-sm p-2 text-sm border">
+                        <datalist id="mode-list">
+                            <option value="Auto">
+                            <option value="Manual">
+                        </datalist>
+                    </div>
+                </div>
+            </div>
+
+            <button type="submit" class="btn-primary btn-lg w-full">
+                <i class="fas fa-paper-plane"></i> Send Request
+            </button>
+        </form>
+    </div>
+
+    <!-- 結果顯示 -->
+    {% if error %}
+        <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded shadow mb-8">
+            <p class="font-bold">Error</p>
+            <p>{{ error }}</p>
+        </div>
+    {% endif %}
+
+    {% if result %}
+        <div class="bg-white shadow-lg rounded-xl overflow-hidden border border-gray-200">
+            <div class="px-6 py-4 {% if result.status_code == 200 %}bg-green-600{% elif result.status_code == 202 %}bg-yellow-500{% else %}bg-red-600{% endif %} text-white flex justify-between items-center">
+                <h3 class="font-bold">API Request</h3>
+                <span class="bg-white/20 px-3 py-1 rounded text-sm font-mono">{{ result.status_code }} {{ result.reason }}</span>
+            </div>
+            <div class="p-6">
+                <div class="mb-4">
+                    <p class="text-xs font-bold text-gray-400 uppercase mb-1">Request URL</p>
+                    <code class="text-sm text-blue-600 font-mono">{{ endpoint }}</code>
+                </div>
+                <div>
+                    <p class="text-xs font-bold text-gray-400 uppercase mb-1">Response Body</p>
+                    <pre class="bg-gray-800 text-green-400 p-4 rounded-lg text-sm overflow-x-auto font-mono">{{ result.content }}</pre>
+                </div>
+            </div>
+        </div>
+    {% endif %}
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    function updateFields() {
+        const endpoint = document.getElementById('endpoint').value;
+        const dataEntryFields = document.getElementById('data-entry-fields');
+
+        if (endpoint === '/EQPAction_DataEntry') {
+            dataEntryFields.classList.remove('hidden');
+        } else {
+            dataEntryFields.classList.add('hidden');
+        }
+
+        const actionLabel = document.getElementById('action-label');
+        if (endpoint === '/ContactInquiry') {
+            actionLabel.innerText = "動作類型 (選填)";
+        } else {
+            actionLabel.innerText = "Action";
+        }
+    }
+
+    updateFields();
+</script>
+{% endblock %}

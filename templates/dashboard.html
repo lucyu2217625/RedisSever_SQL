@@ -1,0 +1,549 @@
+{% extends "layout.html" %}
+
+{% block title %}儀表板 - Redis 佇列管理系統{% endblock %}
+
+{% block head %}
+<style>
+  .stat-card   { transition: box-shadow .15s; }
+  .stat-card:hover { box-shadow: 0 0 0 2px #bfdbfe; }
+  .worker-cell { transition: background .15s; }
+  .worker-cell:hover { background: #f3f4f6; }
+  .badge-idle    { background:#d1fae5; color:#065f46; }
+  .badge-busy    { background:#fee2e2; color:#991b1b; }
+  .badge-ghost   { background:#fef3c7; color:#92400e; }
+  .badge-offline { background:#f3f4f6; color:#6b7280; }
+  .badge-unknown { background:#f3f4f6; color:#6b7280; }
+  .bar-fill { transition: width .4s ease; }
+  .pulse-dot { animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  .q-warn { color: #dc2626; font-weight: 600; }
+  .q-ok   { color: #374151; }
+  .dashboard-item { position: relative; min-height: 96px; }
+  .dashboard-editing .dashboard-item {
+    cursor: grab;
+    outline: 2px dashed #93c5fd;
+    outline-offset: 2px;
+  }
+  .dashboard-editing .dashboard-item.dragging { opacity: .45; }
+  .dashboard-resize-handle {
+    display: none;
+    position: absolute;
+    right: 6px;
+    bottom: 6px;
+    width: 14px;
+    height: 14px;
+    border-right: 2px solid #60a5fa;
+    border-bottom: 2px solid #60a5fa;
+    cursor: nwse-resize;
+  }
+  .dashboard-editing .dashboard-resize-handle { display: block; }
+  .trend-chart-wrap {
+    position: relative;
+    height: calc(100% - 36px);
+    min-height: 200px;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+
+  <!-- 頁首 -->
+  <div class="flex items-center justify-between mb-4">
+    <h1 class="text-lg font-semibold text-gray-800">總覽儀表板</h1>
+    <div class="flex items-center gap-4">
+      <div class="flex items-center gap-1.5 text-xs text-gray-400" id="refresh-info">
+        <span class="pulse-dot w-2 h-2 rounded-full bg-green-400 inline-block"></span>
+        <span id="last-update">載入中…</span>
+      </div>
+      <div class="flex items-center gap-2">
+      <label class="text-xs text-gray-500">趨勢類別</label>
+      <select id="category-select"
+              class="text-xs border border-gray-300 rounded-md px-2 py-1 focus:outline-none focus:ring-2 focus:ring-blue-400">
+        <option value="LotActions">LotActions</option>
+        <option value="LineNotify">LineNotify</option>
+        <option value="prober">prober</option>
+      </select>
+      </div>
+      <div class="flex items-center gap-2">
+        <button type="button" id="layout-edit-btn" class="btn-secondary btn-sm" onclick="toggleLayoutEdit()">
+          <i class="fas fa-pen mr-1"></i> 編輯版面
+        </button>
+        <button type="button" id="layout-save-btn" class="btn-primary btn-sm hidden" onclick="saveLayoutEdit()">
+          <i class="fas fa-save mr-1"></i> 儲存版面
+        </button>
+        <button type="button" id="layout-cancel-btn" class="btn-ghost btn-sm hidden" onclick="cancelLayoutEdit()">
+          取消
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="dashboard-grid" class="grid grid-cols-12 gap-4">
+
+    <div class="dashboard-item stat-card bg-white rounded-xl border border-gray-200 p-4 cursor-pointer"
+         data-layout-id="stat-dispatched-card"
+         data-default-col-span="3"
+         data-default-min-height="112"
+         onclick="navigateWhenView('{{ url_for('queue_history') }}')">
+      <p class="text-xs text-gray-500 mb-1">今日成功任務</p>
+      <p class="text-2xl font-semibold text-gray-800" id="stat-dispatched">—</p>
+      <p class="text-xs text-gray-400 mt-1">點擊查看趨勢</p>
+      <span class="dashboard-resize-handle"></span>
+    </div>
+    <div class="dashboard-item stat-card bg-white rounded-xl border border-gray-200 p-4 cursor-pointer"
+         data-layout-id="stat-failed-card"
+         data-default-col-span="3"
+         data-default-min-height="112"
+         onclick="navigateWhenView('{{ url_for('index') }}?queue_name=LotActions_failed_queue')">
+      <p class="text-xs text-gray-500 mb-1">今日失敗任務</p>
+      <p class="text-2xl font-semibold" id="stat-failed">—</p>
+      <p class="text-xs text-gray-400 mt-1" id="stat-failed-hint">點擊查看詳情</p>
+      <span class="dashboard-resize-handle"></span>
+    </div>
+    <div class="dashboard-item stat-card bg-white rounded-xl border border-gray-200 p-4"
+         data-layout-id="stat-worker-card"
+         data-default-col-span="3"
+         data-default-min-height="112">
+      <p class="text-xs text-gray-500 mb-1">Worker 狀態</p>
+      <p class="text-2xl font-semibold text-gray-800">
+        <span id="stat-online">—</span>
+        <span class="text-sm text-gray-400 font-normal"> / <span id="stat-total">—</span></span>
+      </p>
+      <p class="text-xs mt-1" id="stat-worker-sub">線上</p>
+      <span class="dashboard-resize-handle"></span>
+    </div>
+    <div class="dashboard-item stat-card bg-white rounded-xl border border-gray-200 p-4"
+         data-layout-id="stat-warn-card"
+         data-default-col-span="3"
+         data-default-min-height="112">
+      <p class="text-xs text-gray-500 mb-1">Queue 堆積警告</p>
+      <p class="text-2xl font-semibold" id="stat-warn">—</p>
+      <p class="text-xs text-gray-400 mt-1" id="stat-warn-hint">—</p>
+      <span class="dashboard-resize-handle"></span>
+    </div>
+
+    <div class="dashboard-item bg-white rounded-xl border border-gray-200 p-4"
+         data-layout-id="queue-panel"
+         data-default-col-span="6"
+         data-default-min-height="220">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xs font-medium text-gray-500 uppercase tracking-wide">Queue 狀態</h2>
+        <a href="{{ url_for('queue_lengths') }}"
+           class="text-xs text-blue-500 hover:underline">全部 →</a>
+      </div>
+      <div id="queue-list" class="space-y-2">
+        <div class="text-xs text-gray-400">載入中…</div>
+      </div>
+      <span class="dashboard-resize-handle"></span>
+    </div>
+
+    <div class="dashboard-item bg-white rounded-xl border border-gray-200 p-4"
+         data-layout-id="worker-panel"
+         data-default-col-span="6"
+         data-default-min-height="220">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-xs font-medium text-gray-500 uppercase tracking-wide">Worker 狀態</h2>
+        <a href="{{ url_for('worker_status') }}"
+           class="text-xs text-blue-500 hover:underline">全部 →</a>
+      </div>
+      <div id="worker-grid" class="grid grid-cols-3 gap-2">
+        <div class="text-xs text-gray-400">載入中…</div>
+      </div>
+      <span class="dashboard-resize-handle"></span>
+    </div>
+
+    <div class="dashboard-item bg-white rounded-xl border border-gray-200 p-4"
+         data-layout-id="trend-panel"
+         data-default-col-span="12"
+         data-default-min-height="280">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-xs font-medium text-gray-500 uppercase tracking-wide">
+        任務趨勢（最近 6 小時・30 分鐘顆粒度）
+      </h2>
+      <div class="flex gap-4 text-xs text-gray-400">
+        <span class="flex items-center gap-1">
+          <span class="w-3 h-0.5 bg-blue-500 inline-block rounded"></span>成功
+        </span>
+        <span class="flex items-center gap-1">
+          <span class="w-3 h-0.5 bg-red-400 inline-block rounded"></span>失敗
+        </span>
+        <a href="{{ url_for('queue_history') }}" class="text-blue-500 hover:underline">詳細趨勢 →</a>
+      </div>
+    </div>
+    <div class="trend-chart-wrap">
+      <canvas id="trend-chart"></canvas>
+    </div>
+    <span class="dashboard-resize-handle"></span>
+  </div>
+
+  </div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── 設定 ──────────────────────────────────────────────────────
+const WARN_THRESHOLD = 5;    // Queue 長度超過此值顯示紅色警告
+const REFRESH_MS     = 5000; // 5 秒自動刷新
+const DASHBOARD_LAYOUT_KEY = 'dashboard.layout.v1';
+let trendChart = null;
+let layoutEditing = false;
+let layoutSnapshot = null;
+let draggedLayoutItem = null;
+
+// ── 工具函數 ──────────────────────────────────────────────────
+function shortName(name) {
+  // LotActions_task_queue → LA_task, prober_failed_queue → PRB_failed
+  return name
+    .replace('LotActions_', 'LA_')
+    .replace('LineNotify_', 'LN_')
+    .replace('prober_', 'PRB_')
+    .replace('_queue', '')
+    .replace('_log', '');
+}
+
+function badgeClass(status) {
+  const map = { idle:'badge-idle', busy:'badge-busy',
+                ghost:'badge-ghost', offline:'badge-offline' };
+  return map[status] || 'badge-unknown';
+}
+
+function badgeLabel(status) {
+  if (status === 'ghost') return '👻 ghost';
+  return status;
+}
+
+function navigateWhenView(url) {
+  if (!layoutEditing) {
+    window.location.href = url;
+  }
+}
+
+function dashboardItems() {
+  return Array.from(document.querySelectorAll('#dashboard-grid .dashboard-item'));
+}
+
+function applyItemSize(item, colSpan, minHeight) {
+  const span = Math.max(2, Math.min(12, parseInt(colSpan || item.dataset.defaultColSpan || 12, 10)));
+  const height = Math.max(96, parseInt(minHeight || item.dataset.defaultMinHeight || 120, 10));
+
+  item.style.gridColumn = `span ${span}`;
+  item.style.minHeight = `${height}px`;
+  item.dataset.colSpan = span;
+  item.dataset.minHeight = height;
+}
+
+function readCurrentLayout() {
+  return dashboardItems().map(item => ({
+    id: item.dataset.layoutId,
+    colSpan: parseInt(item.dataset.colSpan || item.dataset.defaultColSpan || 12, 10),
+    minHeight: parseInt(item.dataset.minHeight || item.dataset.defaultMinHeight || 120, 10)
+  }));
+}
+
+function applyDashboardLayout(layout) {
+  const grid = document.getElementById('dashboard-grid');
+  const byId = {};
+
+  dashboardItems().forEach(item => {
+    byId[item.dataset.layoutId] = item;
+    applyItemSize(item, item.dataset.defaultColSpan, item.dataset.defaultMinHeight);
+  });
+
+  (layout || []).forEach(config => {
+    const item = byId[config.id];
+    if (!item) return;
+
+    grid.appendChild(item);
+    applyItemSize(item, config.colSpan, config.minHeight);
+  });
+
+  if (trendChart) {
+    setTimeout(() => trendChart.resize(), 0);
+  }
+}
+
+function loadDashboardLayout() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(DASHBOARD_LAYOUT_KEY) || '[]');
+    applyDashboardLayout(saved);
+  } catch (error) {
+    console.error('載入版面失敗:', error);
+    applyDashboardLayout([]);
+  }
+}
+
+function setLayoutButtons(editing) {
+  document.getElementById('layout-edit-btn').classList.toggle('hidden', editing);
+  document.getElementById('layout-save-btn').classList.toggle('hidden', !editing);
+  document.getElementById('layout-cancel-btn').classList.toggle('hidden', !editing);
+}
+
+function toggleLayoutEdit() {
+  layoutEditing = true;
+  layoutSnapshot = readCurrentLayout();
+  document.getElementById('dashboard-grid').classList.add('dashboard-editing');
+  dashboardItems().forEach(item => item.setAttribute('draggable', 'true'));
+  setLayoutButtons(true);
+}
+
+function saveLayoutEdit() {
+  localStorage.setItem(DASHBOARD_LAYOUT_KEY, JSON.stringify(readCurrentLayout()));
+  layoutEditing = false;
+  layoutSnapshot = null;
+  document.getElementById('dashboard-grid').classList.remove('dashboard-editing');
+  dashboardItems().forEach(item => item.removeAttribute('draggable'));
+  setLayoutButtons(false);
+}
+
+function cancelLayoutEdit() {
+  layoutEditing = false;
+  if (layoutSnapshot) {
+    applyDashboardLayout(layoutSnapshot);
+  }
+  layoutSnapshot = null;
+  document.getElementById('dashboard-grid').classList.remove('dashboard-editing');
+  dashboardItems().forEach(item => item.removeAttribute('draggable'));
+  setLayoutButtons(false);
+}
+
+function initDashboardDrag() {
+  const grid = document.getElementById('dashboard-grid');
+
+  grid.addEventListener('dragstart', event => {
+    const item = event.target.closest('.dashboard-item');
+    if (!layoutEditing || !item) return;
+
+    draggedLayoutItem = item;
+    item.classList.add('dragging');
+    event.dataTransfer.effectAllowed = 'move';
+  });
+
+  grid.addEventListener('dragend', () => {
+    if (draggedLayoutItem) {
+      draggedLayoutItem.classList.remove('dragging');
+    }
+    draggedLayoutItem = null;
+  });
+
+  grid.addEventListener('dragover', event => {
+    if (!layoutEditing || !draggedLayoutItem) return;
+
+    event.preventDefault();
+
+    const target = event.target.closest('.dashboard-item');
+    if (!target || target === draggedLayoutItem) return;
+
+    const rect = target.getBoundingClientRect();
+    const afterTarget = event.clientY > rect.top + rect.height / 2;
+    grid.insertBefore(draggedLayoutItem, afterTarget ? target.nextSibling : target);
+  });
+}
+
+function initDashboardResize() {
+  document.querySelectorAll('.dashboard-resize-handle').forEach(handle => {
+    handle.addEventListener('pointerdown', event => {
+      if (!layoutEditing) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const item = handle.closest('.dashboard-item');
+      const grid = document.getElementById('dashboard-grid');
+      const gridStyle = window.getComputedStyle(grid);
+      const gap = parseFloat(gridStyle.columnGap || '0');
+      const colWidth = (grid.clientWidth - gap * 11) / 12;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const startSpan = parseInt(item.dataset.colSpan || item.dataset.defaultColSpan || 12, 10);
+      const startHeight = parseInt(item.dataset.minHeight || item.dataset.defaultMinHeight || item.offsetHeight, 10);
+
+      handle.setPointerCapture(event.pointerId);
+
+      const onMove = moveEvent => {
+        const deltaCols = Math.round((moveEvent.clientX - startX) / Math.max(colWidth + gap, 1));
+        const nextSpan = Math.max(2, Math.min(12, startSpan + deltaCols));
+        const nextHeight = Math.max(96, startHeight + moveEvent.clientY - startY);
+
+        applyItemSize(item, nextSpan, nextHeight);
+
+        if (trendChart && item.querySelector('#trend-chart')) {
+          trendChart.resize();
+        }
+      };
+
+      const onUp = upEvent => {
+        handle.releasePointerCapture(upEvent.pointerId);
+        handle.removeEventListener('pointermove', onMove);
+        handle.removeEventListener('pointerup', onUp);
+        handle.removeEventListener('pointercancel', onUp);
+      };
+
+      handle.addEventListener('pointermove', onMove);
+      handle.addEventListener('pointerup', onUp);
+      handle.addEventListener('pointercancel', onUp);
+    });
+  });
+}
+
+// ── 渲染函數 ──────────────────────────────────────────────────
+function renderQueueList(stats) {
+  if (!stats || stats.length === 0) {
+    document.getElementById('queue-list').innerHTML =
+      '<div class="text-xs text-gray-400">無資料（Queue 尚未建立或不在 ALLOWED_QUEUES 中）</div>';
+    return;
+  }
+  const maxLen = Math.max(...stats.map(s => s.length), 1);
+  let warnCount = 0;
+  let warnName  = '';
+
+  const html = stats.map(s => {
+    const pct     = Math.min((s.length / Math.max(maxLen, 50)) * 100, 100).toFixed(0);
+    const isWarn  = s.name.includes('task_queue') && s.length > WARN_THRESHOLD;
+    if (isWarn) { warnCount++; if (!warnName) warnName = s.name; }
+
+    const barColor = s.name.includes('failed')  ? 'bg-red-400'  :
+                     s.name.includes('dispatch') ? 'bg-green-400':
+                     s.name.includes('task')     ? 'bg-blue-400' : 'bg-gray-300';
+
+    return `
+      <div class="flex items-center gap-2 cursor-pointer hover:bg-gray-50 rounded px-1 py-0.5"
+           onclick="window.location.href='/?queue_name=${s.name}'">
+        <span class="text-xs font-mono w-28 shrink-0 truncate text-gray-700"
+              title="${s.name}">${shortName(s.name)}</span>
+        <div class="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
+          <div class="bar-fill h-full ${barColor} rounded-full" style="width:${pct}%"></div>
+        </div>
+        <span class="text-xs w-8 text-right ${isWarn ? 'q-warn' : 'q-ok'}">${s.length}</span>
+      </div>`;
+  }).join('');
+
+  document.getElementById('queue-list').innerHTML = html;
+
+  // 更新警告卡片
+  const warnEl    = document.getElementById('stat-warn');
+  const warnHint  = document.getElementById('stat-warn-hint');
+  warnEl.textContent  = warnCount;
+  warnEl.className    = 'text-2xl font-semibold ' + (warnCount > 0 ? 'text-red-600' : 'text-gray-800');
+  warnHint.textContent = warnCount > 0 ? `${warnName} 等堆積過多` : '目前無異常';
+}
+
+function renderWorkerGrid(workers) {
+  const el = document.getElementById('worker-grid');
+  if (!workers || Object.keys(workers).length === 0) {
+    el.innerHTML = '<div class="text-xs text-gray-400 col-span-3">無 Worker 資料</div>';
+    return;
+  }
+  el.innerHTML = Object.entries(workers).map(([name, status]) => `
+    <div class="worker-cell rounded-lg border border-gray-200 p-2 cursor-pointer"
+         onclick="window.location.href='{{ url_for('worker_status') }}'">
+      <div class="text-xs text-gray-500 truncate mb-1.5" title="${name}">${name}</div>
+      <span class="text-xs font-medium px-2 py-0.5 rounded-full ${badgeClass(status)}">
+        ${badgeLabel(status)}
+      </span>
+    </div>`).join('');
+}
+
+function renderStats(data) {
+  // 今日成功
+  document.getElementById('stat-dispatched').textContent = data.total_dispatched_today;
+
+  // 今日失敗
+  const failEl   = document.getElementById('stat-failed');
+  const failHint = document.getElementById('stat-failed-hint');
+  failEl.textContent = data.total_failed_today;
+  failEl.className   = 'text-2xl font-semibold ' +
+                       (data.total_failed_today > 0 ? 'text-red-600' : 'text-gray-800');
+  failHint.textContent = data.total_failed_today > 0 ? '點擊查看詳情' : '目前無失敗任務';
+
+  // Worker
+  const ws = data.worker_summary;
+  const online = (ws.idle || 0) + (ws.busy || 0);
+  document.getElementById('stat-online').textContent = online;
+  document.getElementById('stat-total').textContent  = ws.total || 0;
+  const sub = document.getElementById('stat-worker-sub');
+  const ghostCount = ws.ghost || 0;
+  sub.textContent  = ghostCount > 0 ? `${ghostCount} 台失聯` : '全部正常';
+  sub.className    = 'text-xs mt-1 ' + (ghostCount > 0 ? 'text-amber-600' : 'text-green-600');
+}
+
+function renderChart(chartData) {
+  const ctx = document.getElementById('trend-chart').getContext('2d');
+  if (trendChart) {
+    trendChart.data.labels                    = chartData.labels;
+    trendChart.data.datasets[0].data          = chartData.counts_dispatched;
+    trendChart.data.datasets[1].data          = chartData.counts_failed;
+    trendChart.update('none');
+    return;
+  }
+  trendChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: chartData.labels,
+      datasets: [
+        {
+          label: '成功',
+          data: chartData.counts_dispatched,
+          borderColor: '#3b82f6',
+          backgroundColor: 'rgba(59,130,246,0.07)',
+          borderWidth: 1.5, pointRadius: 2, tension: 0.3, fill: true
+        },
+        {
+          label: '失敗',
+          data: chartData.counts_failed,
+          borderColor: '#f87171',
+          backgroundColor: 'rgba(248,113,113,0.07)',
+          borderWidth: 1.5, pointRadius: 2, tension: 0.3, fill: true
+        }
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: { titleFont: { size: 11 }, bodyFont: { size: 11 } }
+      },
+      scales: {
+        x: { ticks: { font: { size: 10 }, color: '#9ca3af' },
+             grid:  { color: 'rgba(0,0,0,0.05)' } },
+        y: { beginAtZero: true,
+             ticks: { font: { size: 10 }, color: '#9ca3af', stepSize: 1 },
+             grid:  { color: 'rgba(0,0,0,0.05)' } }
+      }
+    }
+  });
+}
+
+// ── 資料更新 ──────────────────────────────────────────────────
+async function refresh() {
+  const cat = document.getElementById('category-select').value;
+  try {
+    const res  = await fetch(`/dashboard_data?category=${cat}`);
+    if (!res.ok) return;
+    const data = await res.json();
+
+    renderStats(data);
+    renderQueueList(data.queue_stats);
+    renderWorkerGrid(data.workers);
+    renderChart(data.chart_data);
+
+    document.getElementById('last-update').textContent =
+      `最後更新 ${data.generated_at}`;
+  } catch (e) {
+    console.error('Dashboard 更新失敗:', e);
+  }
+}
+
+// ── 初始化 ────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  loadDashboardLayout();
+  initDashboardDrag();
+  initDashboardResize();
+  refresh();
+  setInterval(refresh, REFRESH_MS);
+
+  document.getElementById('category-select').addEventListener('change', refresh);
+});
+</script>
+{% endblock %}

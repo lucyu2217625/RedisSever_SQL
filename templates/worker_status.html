@@ -1,0 +1,501 @@
+{% extends "layout.html" %}
+
+{% block title %}Worker 狀態 - Redis 佇列管理系統{% endblock %}
+
+{% block head %}
+<style>
+    .worker-cell {
+        transition: background .15s, border-color .15s, box-shadow .15s, transform .15s;
+    }
+
+    .worker-cell:hover {
+        background: #f9fafb;
+        border-color: #bfdbfe;
+        box-shadow: 0 0 0 2px #dbeafe;
+        transform: translateY(-1px);
+    }
+
+    .status-btn-busy {
+        background-color: #dc2626;
+        color: #fff;
+        border-color: #dc2626;
+    }
+
+    .status-btn-busy:hover {
+        background-color: #b91c1c;
+        border-color: #b91c1c;
+    }
+
+    .status-btn-idle {
+        background-color: #ecfdf5;
+        color: #047857;
+        border-color: #a7f3d0;
+    }
+
+    .status-btn-idle:hover {
+        background-color: #d1fae5;
+        border-color: #6ee7b7;
+    }
+
+    .status-btn-offline {
+        background-color: #f3f4f6;
+        color: #4b5563;
+        border-color: #d1d5db;
+    }
+
+    .status-btn-offline:hover {
+        background-color: #e5e7eb;
+        border-color: #9ca3af;
+    }
+
+    .status-btn-unknown {
+        background-color: #fffbeb;
+        color: #b45309;
+        border-color: #fde68a;
+    }
+
+    .status-btn-unknown:hover {
+        background-color: #fef3c7;
+        border-color: #fcd34d;
+    }
+
+    .status-idle {
+        background: #4ade80;
+    }
+
+    .status-busy {
+        background: #f87171;
+    }
+
+    .status-ghost {
+        background: #fbbf24;
+    }
+
+    .status-offline {
+        background: #d1d5db;
+    }
+
+    .status-unknown {
+        background: #9ca3af;
+    }
+
+    .badge-idle {
+        background: #d1fae5;
+        color: #065f46;
+    }
+
+    .badge-busy {
+        background: #fee2e2;
+        color: #991b1b;
+    }
+
+    .badge-ghost {
+        background: #fef3c7;
+        color: #92400e;
+    }
+
+    .badge-offline {
+        background: #f3f4f6;
+        color: #6b7280;
+    }
+
+    .badge-unknown {
+        background: #f3f4f6;
+        color: #6b7280;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-4">
+
+    <h1 class="text-lg font-semibold text-gray-800">
+        Worker 即時狀態
+    </h1>
+
+    <div class="flex items-center gap-3">
+
+        <div class="flex items-center gap-2 text-xs text-gray-400">
+            <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+            <span id="last-update">自動更新中…</span>
+        </div>
+
+        {% if session.get('role') == 'admin' %}
+        <div class="flex gap-2">
+
+            {#
+            <button
+                type="button"
+                id="edit-btn"
+                class="btn-secondary btn-sm"
+                onclick="toggleEditMode()"
+            >
+                <i class="fas fa-pen mr-1"></i>
+                編輯狀態
+            </button>
+            #}
+
+            <button
+                type="button"
+                id="save-btn"
+                class="btn-primary btn-sm hidden"
+                onclick="saveChanges()"
+            >
+                <i class="fas fa-save mr-1"></i>
+                儲存變更
+            </button>
+
+            <button
+                type="button"
+                id="cancel-btn"
+                class="btn-ghost btn-sm hidden"
+                onclick="cancelEditMode()"
+            >
+                取消
+            </button>
+
+        </div>
+        {% endif %}
+
+    </div>
+
+</div>
+
+<div class="card p-5">
+
+    <div
+        id="worker-grid"
+        class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4"
+    >
+
+        <div class="col-span-full py-12 text-center text-gray-400">
+            <i class="fas fa-circle-notch fa-spin mr-2"></i>
+            正在載入 Worker 狀態...
+        </div>
+
+    </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+
+    const IS_ADMIN = {{ 'true' if session.get('role') == 'admin' else 'false' }};
+
+    let workerGroups = {};
+    let editingMode = false;
+    let updating = false;
+
+    function normalizeStatus(status) {
+
+        return (status || 'unknown')
+            .toString()
+            .trim()
+            .toLowerCase();
+    }
+
+    function statusClass(status) {
+
+        const map = {
+            idle: 'badge-idle',
+            busy: 'badge-busy',
+            ghost: 'badge-ghost',
+            offline: 'badge-offline'
+        };
+
+        return map[normalizeStatus(status)] || 'badge-unknown';
+    }
+
+    function statusDotClass(status) {
+
+        const map = {
+            idle: 'status-idle',
+            busy: 'status-busy',
+            ghost: 'status-ghost',
+            offline: 'status-offline'
+        };
+
+        return map[normalizeStatus(status)] || 'status-unknown';
+    }
+
+    function statusButtonClass(status) {
+
+        const map = {
+            idle: 'btn-secondary btn-sm status-btn-idle',
+            busy: 'btn-secondary btn-sm status-btn-busy',
+            ghost: 'btn-secondary btn-sm status-btn-unknown',
+            offline: 'btn-secondary btn-sm status-btn-offline'
+        };
+
+        return map[normalizeStatus(status)] || 'btn-secondary btn-sm status-btn-unknown';
+    }
+
+    function nextStatus(status) {
+
+        status = normalizeStatus(status);
+
+        if (status === 'busy') return 'idle';
+        if (status === 'idle') return 'offline';
+        if (status === 'offline') return 'busy';
+
+        return 'busy';
+    }
+
+    function flattenWorkers() {
+
+        const list = [];
+
+        Object.entries(workerGroups).forEach(([queueName, workers]) => {
+
+            Object.entries(workers || {}).forEach(([name, status]) => {
+
+                list.push({
+                    queueName,
+                    name,
+                    status: normalizeStatus(status)
+                });
+            });
+        });
+
+        return list;
+    }
+
+    function renderWorkers() {
+
+        const grid = document.getElementById('worker-grid');
+
+        const workers = flattenWorkers();
+
+        if (!workers.length) {
+
+            grid.innerHTML = `
+                <div class="col-span-full py-12 text-center text-gray-400">
+                    目前無 Worker 連線
+                </div>
+            `;
+
+            return;
+        }
+
+        grid.innerHTML = workers.map(({ queueName, name, status }) => {
+
+            const statusNode = editingMode
+                ? `
+                    <button
+                        type="button"
+                        class="${statusButtonClass(status)}"
+                        data-queue="${queueName}"
+                        data-worker="${name}"
+                        data-status="${status}"
+                        onclick="cycleWorkerStatus(this)"
+                    >
+                        ${status}
+                    </button>
+                `
+                : `
+                    <span class="text-xs font-medium px-2 py-0.5 rounded-full ${statusClass(status)}">
+                        ${status}
+                    </span>
+                `;
+
+            return `
+                <div
+                    class="worker-cell rounded-lg border border-gray-200 p-3 bg-white"
+                    data-queue="${queueName}"
+                    data-worker="${name}"
+                    data-status="${status}"
+                >
+
+                    <div
+                        class="text-xs text-gray-500 truncate mb-2"
+                        title="${name}"
+                    >
+                        ${name}
+                    </div>
+
+                    <div class="flex items-center justify-between">
+
+                        ${statusNode}
+
+                        <span class="w-2.5 h-2.5 rounded-full ${statusDotClass(status)}"></span>
+
+                    </div>
+
+                </div>
+            `;
+
+        }).join('');
+    }
+
+    async function updateData() {
+
+        if (editingMode || updating) return;
+
+        updating = true;
+
+        try {
+
+            const response = await fetch(
+                '/worker_status_partial',
+                {
+                    cache: 'no-store'
+                }
+            );
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            workerGroups = await response.json();
+
+            renderWorkers();
+
+            const now = new Date();
+
+            document.getElementById('last-update').textContent =
+                '最後更新: ' +
+                now.getHours() + ':' +
+                String(now.getMinutes()).padStart(2, '0') + ':' +
+                String(now.getSeconds()).padStart(2, '0');
+
+        } catch (error) {
+
+            console.error('更新失敗:', error);
+
+        } finally {
+
+            updating = false;
+        }
+    }
+
+    function toggleEditMode() {
+
+        editingMode = true;
+
+        document.getElementById('edit-btn').classList.add('hidden');
+        document.getElementById('save-btn').classList.remove('hidden');
+        document.getElementById('cancel-btn').classList.remove('hidden');
+
+        renderWorkers();
+    }
+
+    function cancelEditMode() {
+
+        editingMode = false;
+
+        document.getElementById('edit-btn').classList.remove('hidden');
+        document.getElementById('save-btn').classList.add('hidden');
+        document.getElementById('cancel-btn').classList.add('hidden');
+
+        renderWorkers();
+    }
+
+    function cycleWorkerStatus(el) {
+
+        if (!editingMode || !el) return;
+
+        const queueName = el.getAttribute('data-queue');
+
+        const workerName = el.getAttribute('data-worker');
+
+        const currentStatus = normalizeStatus(
+            el.getAttribute('data-status')
+        );
+
+        const next = nextStatus(currentStatus);
+
+        el.setAttribute('data-status', next);
+
+        el.textContent = next;
+
+        el.className = statusButtonClass(next);
+
+        const root = el.closest('.worker-cell');
+
+        if (root) {
+
+            root.setAttribute('data-status', next);
+
+            const dot = root.querySelector('.w-2\\.5');
+
+            if (dot) {
+
+                dot.className =
+                    `w-2.5 h-2.5 rounded-full ${statusDotClass(next)}`;
+            }
+        }
+
+        if (
+            workerGroups[queueName] &&
+            workerGroups[queueName][workerName] !== undefined
+        ) {
+
+            workerGroups[queueName][workerName] = next;
+        }
+    }
+
+    async function saveChanges() {
+
+        const requests = Object.entries(workerGroups).map(
+            ([queueName, workers]) => {
+
+                const fd = new FormData();
+
+                fd.append(
+                    'queue_name',
+                    `${queueName}_worker_status`
+                );
+
+                Object.entries(workers || {}).forEach(
+                    ([name, status]) => {
+
+                        fd.append(
+                            `status_${name}`,
+                            status
+                        );
+                    }
+                );
+
+                return fetch(
+                    '{{ url_for("update_status") }}',
+                    {
+                        method: 'POST',
+                        body: fd
+                    }
+                );
+            }
+        );
+
+        try {
+
+            const responses = await Promise.all(requests);
+
+            for (const res of responses) {
+
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
+                }
+            }
+
+            cancelEditMode();
+
+            await updateData();
+
+        } catch (error) {
+
+            console.error('儲存失敗:', error);
+
+            alert('儲存失敗，請稍後再試');
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+
+        updateData();
+
+        setInterval(updateData, 5000);
+    });
+
+</script>
+{% endblock %}

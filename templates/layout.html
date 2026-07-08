@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Redis 佇列管理系統{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/tailwind.min.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='fontawesome/css/all.min.css') }}">
+    <script src="{{ url_for('static', filename='js/chart.umd.min.js') }}"></script>
+    <style>
+        .active-nav { background-color: #eff6ff; color: #1d4ed8; font-weight: 500; }
+        .card { background: white; border-radius: 0.75rem; border: 1px solid #e5e7eb; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05); }
+        .btn-primary,
+        .btn-secondary,
+        .btn-danger,
+        .btn-danger-subtle,
+        .btn-ghost {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.375rem;
+            min-height: 2.25rem;
+            padding: 0.5rem 0.875rem;
+            border-radius: 0.5rem;
+            border: 1px solid transparent;
+            font-size: 0.875rem;
+            font-weight: 500;
+            line-height: 1.25rem;
+            transition: background-color 0.15s, border-color 0.15s, color 0.15s, box-shadow 0.15s, transform 0.15s;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+        }
+        .btn-primary:hover,
+        .btn-secondary:hover,
+        .btn-danger:hover,
+        .btn-danger-subtle:hover,
+        .btn-ghost:hover { transform: translateY(-1px); }
+        .btn-primary:focus-visible,
+        .btn-secondary:focus-visible,
+        .btn-danger:focus-visible,
+        .btn-danger-subtle:focus-visible,
+        .btn-ghost:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25); }
+        .btn-primary { background-color: #2563eb; color: white; border-color: #2563eb; }
+        .btn-primary:hover { background-color: #1d4ed8; border-color: #1d4ed8; }
+        .btn-secondary { background-color: #ffffff; color: #374151; border-color: #d1d5db; }
+        .btn-secondary:hover { background-color: #f9fafb; border-color: #9ca3af; }
+        .btn-danger { background-color: #dc2626; color: white; border-color: #dc2626; }
+        .btn-danger:hover { background-color: #b91c1c; border-color: #b91c1c; }
+        .btn-danger-subtle { background-color: #fff1f2; color: #be123c; border-color: #fecdd3; }
+        .btn-danger-subtle:hover { background-color: #ffe4e6; border-color: #fda4af; }
+        .btn-ghost { background-color: transparent; color: #6b7280; border-color: transparent; box-shadow: none; }
+        .btn-ghost:hover { background-color: #f3f4f6; color: #374151; box-shadow: none; }
+        .btn-sm { min-height: 1.875rem; padding: 0.25rem 0.625rem; border-radius: 0.375rem; font-size: 0.75rem; }
+        .btn-lg { min-height: 2.75rem; padding: 0.75rem 1rem; border-radius: 0.625rem; font-weight: 600; }
+        .hidden { display: none !important; }
+    </style>
+    {% block head %}{% endblock %}
+</head>
+<body class="bg-gray-100 font-sans min-h-screen">
+
+    <!-- ── 頂部導覽 ── -->
+    <nav class="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between sticky top-0 z-50">
+        <div class="flex items-center gap-6">
+            <span class="font-semibold text-gray-800 text-sm">Redis 佇列管理系統</span>
+            <div class="flex gap-1">
+                <a href="{{ url_for('dashboard') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'dashboard' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-chart-pie mr-1"></i>儀表板
+                </a>
+                <a href="{{ url_for('index') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'index' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-search mr-1"></i>Queue 查詢
+                </a>
+                <a href="{{ url_for('queue_lengths') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'queue_lengths' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-list-alt mr-1"></i>Queue 總覽
+                </a>
+                <a href="{{ url_for('worker_status') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'worker_status' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-robot mr-1"></i>Worker
+                </a>
+                <a href="{{ url_for('queue_history') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'queue_history' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-chart-line mr-1"></i>趨勢圖
+                </a>
+                <a href="{{ url_for('api_trigger') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'api_trigger' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-paper-plane mr-1"></i>API 測試
+                </a>
+                {% block extra_nav %}{% endblock %}
+                {% if session.get('role') == 'admin' %}
+                <a href="{{ url_for('equipments') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'equipments' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-server mr-1"></i>設備
+                </a>
+                <a href="{{ url_for('contacts') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'contacts' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-address-book mr-1"></i>聯絡人
+                </a>
+                <a href="{{ url_for('register') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'register' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-users-cog mr-1"></i>帳號管理
+                </a>
+                {% endif %}
+            </div>
+        </div>
+        <div class="flex items-center gap-4">
+            <span class="text-xs text-gray-500"><i class="fas fa-user mr-1"></i>{{ session.get('username') }}</span>
+            <a href="{{ url_for('logout') }}" class="text-xs text-gray-400 hover:text-gray-600" title="登出">
+                <i class="fas fa-sign-out-alt"></i>
+            </a>
+        </div>
+    </nav>
+
+    <!-- ── 主體 ── -->
+    <main class="p-5 max-w-screen-xl mx-auto">
+        <!-- Flash Messages -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+          {% if messages %}
+            {% for category, message in messages %}
+              <div class="mb-4 p-3 rounded-lg text-sm {% if category == 'error' %}bg-red-50 text-red-700 border border-red-200{% else %}bg-green-50 text-green-700 border border-green-200{% endif %}">
+                {{ message }}
+              </div>
+            {% endfor %}
+          {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

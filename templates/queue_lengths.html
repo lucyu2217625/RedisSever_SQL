@@ -1,0 +1,73 @@
+{% extends "layout.html" %}
+
+{% block title %}Queue 總覽 - Redis 佇列管理系統{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+    <h1 class="text-lg font-semibold text-gray-800">各佇列堆積狀況</h1>
+    <div class="flex items-center gap-2 text-xs text-gray-400" id="refresh-info">
+        <span class="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>
+        <span id="last-update">自動更新中…</span>
+    </div>
+</div>
+
+<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6" id="queue-container">
+    {% for prefix, queues in grouped_queues.items() %}
+    <div class="card overflow-hidden">
+        <div class="bg-gray-50 px-4 py-3 border-b border-gray-200">
+            <h2 class="text-xs font-bold text-gray-600 uppercase tracking-widest">{{ prefix }} </h2>
+        </div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-left text-sm">
+                <tbody class="divide-y divide-gray-50" id="tbody-{{ prefix }}">
+                    {% for q in queues %}
+                        {% if q.type != 'hash' %}
+                        <tr class="hover:bg-blue-50 cursor-pointer transition-colors group"
+                            onclick="window.location.href='/?queue_name={{ q.name }}'">
+                            <td class="py-3 px-4 font-mono text-xs text-gray-600 group-hover:text-blue-700">
+                                {{ q.name }}
+                            </td>
+                            <td class="py-3 px-4 text-right">
+                                <span class="{% if q.length > 20 %}text-red-600 font-bold{% else %}text-gray-900{% endif %}">
+                                    {{ q.length }}
+                                </span>
+                            </td>
+                        </tr>
+                        {% endif %}
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    async function updateData() {
+        try {
+            const response = await fetch('/queue_lengths_partial');
+            const data = await response.json();
+            
+            // 由於後端回傳的是 HTML 字串陣列，對應各 prefix
+            const prefixes = {{ grouped_queues.keys()|list|tojson }};
+            prefixes.forEach((prefix, index) => {
+                const tbody = document.getElementById('tbody-' + prefix);
+                if (tbody && data[index]) {
+                    tbody.innerHTML = data[index];
+                }
+            });
+            
+            const now = new Date();
+            document.getElementById('last-update').textContent = '最後更新: ' + now.getHours() + ':' + String(now.getMinutes()).padStart(2, '0') + ':' + String(now.getSeconds()).padStart(2, '0');
+        } catch (error) {
+            console.error('更新失敗:', error);
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        setInterval(updateData, 5000);
+    });
+</script>
+{% endblock %}

@@ -1,0 +1,166 @@
+{% extends "layout.html" %}
+
+{% block title %}設備管理 - Redis 佇列管理系統{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+    <h1 class="text-lg font-semibold text-gray-800">設備配置管理</h1>
+    <div class="flex gap-2">
+        <a href="{{ url_for('download', queue_name='equipments') }}" class="btn-secondary">
+            <i class="fas fa-download mr-1"></i> 下載 JSON
+        </a>
+        {% if user_role == 'admin' %}
+        <button onclick="toggleEditMode()" id="edit-btn" class="btn-secondary">
+            <i class="fas fa-edit mr-1"></i> 編輯模式
+        </button>
+        <button onclick="saveChanges()" id="save-btn" class="btn-primary hidden">
+            <i class="fas fa-save mr-1"></i> 儲存變更
+        </button>
+        {% endif %}
+    </div>
+</div>
+
+<!-- 篩選卡片 -->
+<div class="card p-4 mb-6">
+    <form method="GET" action="{{ url_for('equipments') }}" class="flex flex-wrap items-end gap-4">
+        <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-gray-500">樓層</label>
+            <input type="text" name="floor" value="{{ filter_floor }}" placeholder="如: 2AF" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none w-24">
+        </div>
+        <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-gray-500">設備類型</label>
+            <input type="text" name="eqptype" value="{{ filter_eqptype }}" placeholder="如: OPUS" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none w-32">
+        </div>
+        <div class="flex flex-col gap-1">
+            <label class="text-xs font-medium text-gray-500">EQPID</label>
+            <input type="text" name="eqpid" value="{{ filter_eqpid }}" placeholder="關鍵字..." class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none w-40">
+        </div>
+        <button type="submit" class="btn-primary">
+            <i class="fas fa-filter mr-1"></i> 篩選
+        </button>
+        <a href="{{ url_for('equipments') }}" class="btn-secondary">清除</a>
+    </form>
+</div>
+
+{% if error %}
+<div class="bg-amber-50 border border-amber-200 text-amber-800 p-4 rounded-xl text-sm mb-6 flex items-center gap-3">
+    <i class="fas fa-info-circle text-amber-500"></i>
+    {{ error }}
+</div>
+{% endif %}
+
+<!-- 列表卡片 -->
+<form id="equip-form" method="POST" action="{{ url_for('update_equipments') }}">
+    <input type="hidden" name="edit_mode" value="1">
+    <div class="card overflow-hidden">
+        <div class="overflow-x-auto">
+            <table class="w-full text-left border-collapse">
+                <thead>
+                    <tr class="bg-gray-50 border-b border-gray-200">
+                        <th class="p-3 text-xs font-bold text-gray-600 uppercase">EQPID</th>
+                        <th class="p-3 text-xs font-bold text-gray-600 uppercase">樓層</th>
+                        <th class="p-3 text-xs font-bold text-gray-600 uppercase">type</th>
+                        <th class="p-3 text-xs font-bold text-gray-600 uppercase">Tester IP</th>
+                        <th class="p-3 text-xs font-bold text-gray-600 uppercase">Prober IP</th>
+                        <th class="p-3 text-xs font-bold text-gray-600 uppercase">REMARK</th>
+                        <th class="p-3 text-xs font-bold text-gray-600 uppercase">Action</th>
+                        <th class="p-3 text-xs font-bold text-gray-600 uppercase delete-column hidden">刪除</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100" id="equip-tbody">
+                    {% for key, val_str in hash_data.items() %}
+                    {% set d = val_str | from_json %}
+                    <tr class="hover:bg-gray-50 transition-colors">
+                        <td class="p-3"><span class="text-sm font-mono font-bold text-blue-700">{{ key }}</span></td>
+                        <td class="p-3">
+                            <span class="view-mode text-sm font-mono">{{ d.floor }}</span>
+                            <input type="text" name="floor_{{ key }}" value="{{ d.floor }}" class="edit-mode hidden text-sm border border-gray-300 rounded px-2 py-1 w-full">
+                        </td>
+                        <td class="p-3">
+                            <span class="view-mode text-sm font-mono">{{ d.EQPTYPE }}</span>
+                            <input type="text" name="EQPTYPE_{{ key }}" value="{{ d.EQPTYPE }}" class="edit-mode hidden text-sm border border-gray-300 rounded px-2 py-1 w-full">
+                        </td>
+                        <td class="p-3">
+                            <span class="view-mode text-sm font-mono">{{ d.TESTERIP }}</span>
+                            <input type="text" name="TESTERIP_{{ key }}" value="{{ d.TESTERIP }}" class="edit-mode hidden text-sm border border-gray-300 rounded px-2 py-1 w-full font-mono">
+                        </td>
+                        <td class="p-3">
+                            <span class="view-mode text-sm font-mono">{{ d.PROBERIP }}</span>
+                            <input type="text" name="PROBERIP_{{ key }}" value="{{ d.PROBERIP }}" class="edit-mode hidden text-sm border border-gray-300 rounded px-2 py-1 w-full font-mono">
+                        </td>
+                        <td class="p-3">
+                            <span class="view-mode text-sm font-mono">{{ d.LINEGROUP }}</span>
+                            <input type="text" name="LINEGROUP_{{ key }}" value="{{ d.LINEGROUP }}" class="edit-mode hidden text-sm border border-gray-300 rounded px-2 py-1 w-full">
+                        </td>
+                        <td class="p-3">
+                            <span class="view-mode text-sm font-mono">{{ d.Action }}</span>
+                            <input type="text" name="ACTION_{{ key }}" value="{{ d.Action }}" class="edit-mode hidden text-sm border border-gray-300 rounded px-2 py-1 w-full">
+                        </td>
+                        <td class="p-3 delete-column hidden">
+                            <input type="checkbox" name="delete_{{ key }}" class="rounded text-red-600 focus:ring-red-500">
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        
+        <!-- 新增列按鈕 (編輯模式下顯示) -->
+        <div class="p-4 bg-gray-50 border-t border-gray-200 edit-mode hidden">
+            <button type="button" onclick="addNewRow()" class="btn-secondary btn-sm">
+                <i class="fas fa-plus-circle mr-1"></i> 新增設備
+            </button>
+        </div>
+    </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    function toggleEditMode() {
+        const isEditing = !document.getElementById('save-btn').classList.contains('hidden');
+        
+        if (isEditing) {
+            // 切換回預覽
+            document.querySelectorAll('.new-equipment-row').forEach(row => row.remove());
+            document.querySelectorAll('.edit-mode').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.view-mode').forEach(el => el.classList.remove('hidden'));
+            document.querySelectorAll('.delete-column').forEach(el => el.classList.add('hidden'));
+            document.getElementById('save-btn').classList.add('hidden');
+            document.getElementById('edit-btn').innerHTML = '<i class="fas fa-edit mr-1"></i> 編輯模式';
+            document.getElementById('edit-btn').className = 'btn-secondary';
+        } else {
+            // 進入編輯
+            document.querySelectorAll('.edit-mode').forEach(el => el.classList.remove('hidden'));
+            document.querySelectorAll('.view-mode').forEach(el => el.classList.add('hidden'));
+            document.querySelectorAll('.delete-column').forEach(el => el.classList.remove('hidden'));
+            document.getElementById('save-btn').classList.remove('hidden');
+            document.getElementById('edit-btn').innerText = '取消';
+            document.getElementById('edit-btn').className = 'btn-ghost';
+        }
+    }
+
+    function saveChanges() {
+        if (confirm('確定要儲存所有變更嗎？')) {
+            document.getElementById('equip-form').submit();
+        }
+    }
+
+    function addNewRow() {
+        const tbody = document.getElementById('equip-tbody');
+        const tr = document.createElement('tr');
+        tr.className = 'new-equipment-row bg-blue-50/30';
+        tr.innerHTML = `
+            <td class="p-3"><input type="text" name="new_EQPID[]" placeholder="新 EQPID" class="text-sm border border-blue-300 rounded px-2 py-1 w-full font-bold"></td>
+            <td class="p-3"><input type="text" name="new_floor[]" placeholder="樓層" class="text-sm border border-blue-300 rounded px-2 py-1 w-full"></td>
+            <td class="p-3"><input type="text" name="new_EQPTYPE[]" placeholder="類型" class="text-sm border border-blue-300 rounded px-2 py-1 w-full"></td>
+            <td class="p-3"><input type="text" name="new_TESTERIP[]" placeholder="Tester IP" class="text-sm border border-blue-300 rounded px-2 py-1 w-full font-mono"></td>
+            <td class="p-3"><input type="text" name="new_PROBERIP[]" placeholder="Prober IP" class="text-sm border border-blue-300 rounded px-2 py-1 w-full font-mono"></td>
+            <td class="p-3"><input type="text" name="new_LINEGROUP[]" placeholder="LineGroup" class="text-sm border border-blue-300 rounded px-2 py-1 w-full"></td>
+            <td class="p-3"><input type="text" name="new_ACTION[]" placeholder="Action" class="text-sm border border-blue-300 rounded px-2 py-1 w-full"></td>
+            <td class="p-3"></td>
+        `;
+        tbody.appendChild(tr);
+    }
+</script>
+{% endblock %}
