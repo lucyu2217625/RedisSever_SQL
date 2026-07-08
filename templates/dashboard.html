@@ -203,14 +203,6 @@ function shortName(name) {
 }
 
 function queueTargetUrl(name) {
-  if (name.endsWith('_dispatched_log')) {
-    const category = name.replace('_dispatched_log', '');
-    return `{{ url_for('queue_history') }}?category=${encodeURIComponent(category)}`;
-  }
-  if (name.endsWith('_failed_queue')) {
-    const category = name.replace('_failed_queue', '');
-    return `{{ url_for('queue_history') }}?category=${encodeURIComponent(category)}`;
-  }
   return `/?queue_name=${encodeURIComponent(name)}`;
 }
 
