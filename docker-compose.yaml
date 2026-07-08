@@ -100,11 +100,65 @@ services:
         - REDIS_PORT=6379
         - ALLOWED_QUEUES=LotActions_processing_queue,LotActions_failed_queue,LineNotify_failed_queue,prober_worker_status,prober_processing_queue,LineNotify_retry_queue,prober_dispatched_log,prober_failed_queue,LotActions_retry_queue,LotActions_worker_status,LineNotify_worker_status,LineNotify_processing_queue,LineNotify_task_queue,LotActions_dispatched_log,prober_retry_queue,LineNotify_dispatched_log,prober_task_queue,LotActions_task_queue
         - REDIS_MASTER_NAME=mymaster
+        - POSTGRES_HOST=postgres
+        - POSTGRES_PORT=5432
+        - POSTGRES_DB=queue_system
+        - POSTGRES_USER=queue_admin
+        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-please-change-me}
       depends_on:
         - redis-master
+        - postgres
       networks:
         redisnet:
           ipv4_address: 172.18.0.3
+      volumes:
+        - .:/app
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=queue_system
+      - POSTGRES_USER=queue_admin
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-please-change-me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # 容器第一次啟動、資料目錄是空的時候，會自動執行 /docker-entrypoint-initdb.d/ 下的 .sql
+      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    networks:
+      redisnet:
+        ipv4_address: 172.18.0.4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queue_admin -d queue_system"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # 橋接服務：在 worker 端程式改成直接寫 task_history 之前，
+  # 先把 Redis 的 dispatched_log / failed_queue 同步進 PostgreSQL。
+  # 詳見 sync_history_to_postgres.py 開頭的說明。
+  history-sync:
+      build:
+        context: .
+        dockerfile: Dockerfile.web
+      container_name: history_sync
+      command: ["python", "sync_history_to_postgres.py"]
+      environment:
+        - REDIS_SENTINELS=sentinel1:26379,sentinel2:26379,sentinel3:26379
+        - POSTGRES_HOST=postgres
+        - POSTGRES_PORT=5432
+        - POSTGRES_DB=queue_system
+        - POSTGRES_USER=queue_admin
+        - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-please-change-me}
+      depends_on:
+        - redis-master
+        - postgres
+      networks:
+        redisnet:
+          ipv4_address: 172.18.0.5
       volumes:
         - .:/app
 
@@ -120,6 +174,7 @@ networks:
 volumes:
   redis_slave1_data:
   redis_slave2_data:
+  postgres_data:
 
 # 建立networks  
 # docker network create redisnet  

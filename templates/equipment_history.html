@@ -1,0 +1,62 @@
+{% extends "layout.html" %}
+{% block title %}設備異動紀錄{% endblock %}
+
+{% block content %}
+<div class="card p-5">
+    <h1 class="text-lg font-semibold text-gray-800 mb-4">
+        <i class="fas fa-history mr-2 text-blue-600"></i>設備異動紀錄
+        <span class="text-xs text-gray-400 font-normal ml-2">（由 PostgreSQL trigger 自動記錄，equipments 表任何新增/修改/刪除都會留下痕跡）</span>
+    </h1>
+
+    <form method="GET" class="flex items-center gap-2 mb-4">
+        <input type="text" name="eqpid" value="{{ eqpid }}" placeholder="輸入 EQPID 篩選（留空=顯示全部最近 200 筆）"
+               class="border border-gray-300 rounded-md px-3 py-1.5 text-sm w-80">
+        <button type="submit" class="btn-primary btn-sm">
+            <i class="fas fa-search"></i> 查詢
+        </button>
+    </form>
+
+    {% if error %}
+        <div class="mb-4 p-3 rounded-lg text-sm bg-yellow-50 text-yellow-700 border border-yellow-200">
+            {{ error }}
+        </div>
+    {% endif %}
+
+    {% if history %}
+    <div class="overflow-x-auto">
+        <table class="w-full text-sm text-left">
+            <thead class="bg-gray-50 text-gray-500 text-xs uppercase">
+                <tr>
+                    <th class="py-2 px-3">時間</th>
+                    <th class="py-2 px-3">EQPID</th>
+                    <th class="py-2 px-3">動作</th>
+                    <th class="py-2 px-3">操作者</th>
+                    <th class="py-2 px-3">異動前</th>
+                    <th class="py-2 px-3">異動後</th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-gray-100">
+                {% for row in history %}
+                <tr class="hover:bg-gray-50">
+                    <td class="py-2 px-3 font-mono text-xs text-gray-600 whitespace-nowrap">{{ row.changed_at }}</td>
+                    <td class="py-2 px-3 font-mono">{{ row.eqpid }}</td>
+                    <td class="py-2 px-3">
+                        {% if row.change_type == 'created' %}
+                            <span class="text-xs px-2 py-0.5 rounded-full bg-green-50 text-green-700 border border-green-200">新增</span>
+                        {% elif row.change_type == 'updated' %}
+                            <span class="text-xs px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">修改</span>
+                        {% else %}
+                            <span class="text-xs px-2 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-200">刪除</span>
+                        {% endif %}
+                    </td>
+                    <td class="py-2 px-3 text-gray-600">{{ row.changed_by or '（未知）' }}</td>
+                    <td class="py-2 px-3 font-mono text-xs text-gray-500 max-w-xs truncate" title="{{ row.old_value }}">{{ row.old_value or '-' }}</td>
+                    <td class="py-2 px-3 font-mono text-xs text-gray-500 max-w-xs truncate" title="{{ row.new_value }}">{{ row.new_value or '-' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
