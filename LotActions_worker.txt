@@ -1,0 +1,1 @@
+HSET LotActions_worker_status RPA_OP03 "{\"status\":\"idle\",\"floor\":\"2AF\"}" RPA_OP04 "{\"status\":\"idle\",\"floor\":\"2AF\"}" RPA_OP01 "{\"status\":\"busy\",\"floor\":\"2AF\"}" RPA_OP02 "{\"status\":\"idle\",\"floor\":\"2AF\"}" RPA_OP06 "{\"status\":\"idle\",\"floor\":\"2AF\"}" RPA_OP05 "{\"status\":\"idle\",\"floor\":\"2AF\"}"

@@ -1,0 +1,130 @@
+version: '3.9'
+
+services:
+  redis-master:
+    image: redis:7
+    container_name: redis-master
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - /d/redis_data/master:/data
+      - ./redis-master.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      redisnet:
+        ipv4_address: 172.18.0.2
+    
+  redis-slave1:
+    image: redis:7
+    container_name: redis-slave1
+    ports:
+      - "6380:6379"
+    depends_on:
+      - redis-master
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      # - /d/redis_data/slave1:/data
+      - redis_slave1_data:/data
+      # - /d/redis_data/redis_slave1_data:/data
+      - ./redis-slave1.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      redisnet:
+        ipv4_address: 172.18.0.6
+        
+
+  redis-slave2:
+    image: redis:7
+    container_name: redis-slave2
+    ports:
+      - "6381:6379"
+    depends_on:
+      - redis-master
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      # - /d/redis_data/slave2:/data
+      - redis_slave2_data:/data
+      # - /d/redis_data/redis_slave2_data:/data
+      - ./redis-slave2.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      redisnet:
+        ipv4_address: 172.18.0.7
+
+  sentinel1:
+    build:
+      context: .
+      dockerfile: Dockerfile.sentinel
+    container_name: sentinel1
+    depends_on:
+      - redis-master
+    networks:
+      redisnet:
+        ipv4_address: 172.18.0.8
+    ports:
+      - "26379:26379"
+
+  sentinel2:
+    build:
+      context: .
+      dockerfile: Dockerfile.sentinel
+    container_name: sentinel2
+    depends_on:
+      - redis-master
+    networks:
+      redisnet:
+        ipv4_address: 172.18.0.9
+    ports:
+      - "26380:26379"
+
+  sentinel3:
+    build:
+      context: .
+      dockerfile: Dockerfile.sentinel
+    container_name: sentinel3
+    depends_on:
+      - redis-master
+    networks:
+      redisnet:
+        ipv4_address: 172.18.0.10
+    ports:
+      - "26381:26379"
+
+  web:
+      build:
+        context: .
+        dockerfile: Dockerfile.web
+      container_name: queue_viewer
+      ports:
+        - "5000:5000"
+      environment:
+        - REDIS_HOST=redis-master
+        - REDIS_PORT=6379
+        - ALLOWED_QUEUES=LotActions_processing_queue,LotActions_failed_queue,LineNotify_failed_queue,prober_worker_status,prober_processing_queue,LineNotify_retry_queue,prober_dispatched_log,prober_failed_queue,LotActions_retry_queue,LotActions_worker_status,LineNotify_worker_status,LineNotify_processing_queue,LineNotify_task_queue,LotActions_dispatched_log,prober_retry_queue,LineNotify_dispatched_log,prober_task_queue,LotActions_task_queue
+        - REDIS_MASTER_NAME=mymaster
+      depends_on:
+        - redis-master
+      networks:
+        redisnet:
+          ipv4_address: 172.18.0.3
+      volumes:
+        - .:/app
+
+networks:
+  redisnet:
+    external: true
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+
+volumes:
+  redis_slave1_data:
+  redis_slave2_data:
+
+# 建立networks  
+# docker network create redisnet  
+# docker network create --driver bridge --subnet 172.18.0.0/16 redisnet
+
+# docker compose up -d  啟動容器
+
+# HSET users admin "pbkdf2:sha256:260000$2lNHWlG4c0l7KGHjS37c053c97290e3ddbfb08de2184a5c25101f6406ee5f2e892ba36391c8b9812:admin"

@@ -1,0 +1,11 @@
+[
+    {
+        "name": "LineNotify-RPA-BOT-01",
+        "url": "https://192.168.162.18:16888/iscool/v3/execute/task",
+        "projectID": "86HklPenDDAsPmtc",
+        "taskID": "KT59-m35TfGliLDH",
+        "X-API-KEY": "aa592b58-e58c-4633-8ea9-4fdd5d950546",
+        "rpa_health_url":"https://rpa01.iscoollab.com:16888/iscool/v3/health",
+        "floor": "2F"
+    }    
+]

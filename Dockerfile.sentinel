@@ -1,0 +1,10 @@
+FROM redis:7
+
+# 把你的 entrypoint script 放進容器
+COPY sentinel-entrypoint.sh /usr/local/bin/
+
+# 給它執行權限
+RUN chmod +x /usr/local/bin/sentinel-entrypoint.sh
+
+# 設定這支 script 為容器啟動時要執行的命令
+ENTRYPOINT ["/usr/local/bin/sentinel-entrypoint.sh"]
