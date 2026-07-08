@@ -1059,7 +1059,7 @@ def queue_history():
             sql = """
                 SELECT
                     to_char(
-                        date_bin(%(interval)s, dispatch_time, %(origin)s),
+                        date_bin(%(interval)s, dispatch_time, %(origin)s) AT TIME ZONE 'Asia/Taipei',
                         'MM-DD HH24:MI'
                     ) AS bucket,
                     status,
@@ -1294,7 +1294,7 @@ def dashboard_data():
                 cur.execute(
                     """
                     SELECT
-                        to_char(date_bin(%(interval)s, dispatch_time, %(origin)s), 'HH24:MI') AS bucket,
+                        to_char(date_bin(%(interval)s, dispatch_time, %(origin)s) AT TIME ZONE 'Asia/Taipei', 'HH24:MI') AS bucket,
                         status,
                         count(*)
                     FROM task_history
