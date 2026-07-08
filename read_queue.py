@@ -1227,12 +1227,38 @@ def dashboard_data():
         "prober_task_queue",
         "prober_failed_queue",
     ]
+    history_counts = defaultdict(int)
+    try:
+        with pgConnect.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT category, status, count(*)
+                    FROM task_history
+                    GROUP BY category, status
+                    """
+                )
+                for category_name, status, cnt in cur.fetchall():
+                    history_counts[(category_name, status)] = cnt
+    except Exception:
+        pass
+
     for q in monitored_queues:
-        try:
-            q_type = redisConnect.redis_master.type(q)
-            length = redisConnect.redis_master.llen(q) if q_type == 'list' else 0
-        except Exception:
-            length = 0
+        length = 0
+        if q.endswith('_dispatched_log') or q.endswith('_failed_queue'):
+            if q.endswith('_dispatched_log'):
+                category_name = q[:-len('_dispatched_log')]
+                status = 'dispatched'
+            else:
+                category_name = q[:-len('_failed_queue')]
+                status = 'failed'
+            length = history_counts.get((category_name, status), 0)
+        else:
+            try:
+                q_type = redisConnect.redis_master.type(q)
+                length = redisConnect.redis_master.llen(q) if q_type == 'list' else 0
+            except Exception:
+                length = 0
         queue_stats.append({"name": q, "length": length})
 
     # ── 2. Worker 狀態 ─────────────────────────────────────────
