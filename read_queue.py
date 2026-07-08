@@ -184,6 +184,7 @@ def index():
         per_page = 10
     is_hash = False
     hash_data = {}
+    is_history_queue = False
     user_role = session.get('role', 'viewer')
     total_pages = 1 # Initialize total_pages here
 
@@ -194,7 +195,13 @@ def index():
 
     available_queues = ALLOWED_QUEUES
 
-    if queue_name in ALLOWED_QUEUES:
+    history_view = load_history_queue(queue_name, page, per_page) if queue_name else None
+    if history_view:
+        queue_data = history_view['queue_data']
+        queue_length = history_view['queue_length']
+        total_pages = history_view['total_pages'] or 1
+        is_history_queue = True
+    elif queue_name in ALLOWED_QUEUES:
         try:
             if redisConnect.redis_master.exists(queue_name):
                 key_type = redisConnect.type(queue_name)
@@ -275,6 +282,7 @@ def index():
         per_page=per_page,
         is_hash=is_hash,
         hash_data=hash_data,
+        is_history_queue=is_history_queue,
         user_role=user_role,
         active_page='index'
     )
@@ -284,6 +292,80 @@ def parse_json(item):
         return json.loads(item)
     except json.JSONDecodeError:
         return item
+
+
+def history_queue_spec(queue_name):
+    for suffix, status in (
+        ('_dispatched_log', 'dispatched'),
+        ('_failed_queue', 'failed'),
+    ):
+        if queue_name.endswith(suffix):
+            return queue_name[:-len(suffix)], status
+    return None, None
+
+
+def normalize_history_row(row):
+    payload = row.get('payload') or {}
+    if not isinstance(payload, dict):
+        payload = {'payload': payload}
+
+    dispatch_time = row.get('dispatch_time')
+    if isinstance(dispatch_time, datetime):
+        dispatch_time = dispatch_time.astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
+
+    display = dict(payload)
+    display.update({
+        'category': row.get('category'),
+        'task_id': row.get('task_id'),
+        'status': row.get('status'),
+        'rpa_worker': row.get('rpa_worker'),
+        'dispatch_time': dispatch_time,
+    })
+
+    return {
+        'parsed': display,
+        'raw': json.dumps(display, ensure_ascii=False),
+    }
+
+
+def load_history_queue(queue_name, page, per_page):
+    category, status = history_queue_spec(queue_name)
+    if not category:
+        return None
+
+    offset = (page - 1) * per_page
+    with pgConnect.get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT count(*) AS cnt
+                FROM task_history
+                WHERE category = %s AND status = %s
+                """,
+                (category, status)
+            )
+            total = cur.fetchone()['cnt']
+
+            cur.execute(
+                """
+                SELECT category, task_id, status, rpa_worker, dispatch_time, payload
+                FROM task_history
+                WHERE category = %s AND status = %s
+                ORDER BY dispatch_time DESC, id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (category, status, per_page, offset)
+            )
+            rows = cur.fetchall()
+
+    queue_data = [normalize_history_row(row) for row in rows]
+    total_pages = (total + per_page - 1) // per_page if total else 0
+    return {
+        'queue_data': queue_data,
+        'queue_length': total,
+        'total_pages': total_pages,
+        'is_history_queue': True,
+    }
 
 @app.route('/download')
 @login_required
@@ -295,7 +377,10 @@ def download():
 
     try:
         data = []
-        if redisConnect.redis_master.exists(queue_name):
+        history_view = load_history_queue(queue_name, 1, 1000000) if queue_name else None
+        if history_view:
+            data = [item['parsed'] for item in history_view['queue_data']]
+        elif redisConnect.redis_master.exists(queue_name):
             key_type = redisConnect.type(queue_name)
             if key_type == 'list':
                 # Since decode_responses=True, lrange returns list of strings
@@ -338,6 +423,10 @@ def delete_selected():
     if not queue_name:
         flash("缺少佇列名稱", "error")
         return redirect(url_for('index'))
+
+    if history_queue_spec(queue_name)[0]:
+        flash("歷史紀錄頁面僅供查詢與下載，不能刪除。", "error")
+        return redirect(url_for('index', queue_name=queue_name))
 
     try:
         if delete_all_force:
