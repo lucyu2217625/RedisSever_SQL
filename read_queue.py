@@ -959,30 +959,37 @@ def update_contacts():
     if edit_mode == '1':
         with pgConnect.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT id FROM contacts")
-                existing_ids = [row[0] for row in cur.fetchall()]
+                cur.execute("SELECT id, eqpid, eqptype, action, linegroup, floor FROM contacts")
+                existing_map = {
+                    row[0]: (row[1] or '', row[2] or '', row[3] or '', row[4] or '', row[5] or '')
+                    for row in cur.fetchall()
+                }
+                existing_ids = list(existing_map.keys())
 
                 for key in existing_ids:
                     if request.form.get(f'delete_{key}'):
                         cur.execute("DELETE FROM contacts WHERE id = %s", (key,))
                         continue
 
-                    eqpid = request.form.get(f'EQPID_{key}', '')
-                    eqptype = request.form.get(f'EQPTYPE_{key}', '')
-                    action = request.form.get(f'ACTION_{key}', '')
-                    linegroup = request.form.get(f'LINEGROUP_{key}', '')
-                    floor = request.form.get(f'floor_{key}', '')
+                    eqpid = request.form.get(f'EQPID_{key}', '').strip()
+                    eqptype = request.form.get(f'EQPTYPE_{key}', '').strip()
+                    action = request.form.get(f'ACTION_{key}', '').strip()
+                    linegroup = request.form.get(f'LINEGROUP_{key}', '').strip()
+                    floor = request.form.get(f'floor_{key}', '').strip()
 
                     if eqpid and eqptype and action and linegroup and floor:
-                        cur.execute(
-                            """
-                            UPDATE contacts
-                               SET eqpid = %s, eqptype = %s, action = %s,
-                                   linegroup = %s, floor = %s
-                             WHERE id = %s
-                            """,
-                            (eqpid, eqptype, action, linegroup, floor, key)
-                        )
+                        new_vals = (eqpid, eqptype, action, linegroup, floor)
+                        old_vals = existing_map.get(key)
+                        if old_vals != new_vals:
+                            cur.execute(
+                                """
+                                UPDATE contacts
+                                   SET eqpid = %s, eqptype = %s, action = %s,
+                                       linegroup = %s, floor = %s
+                                 WHERE id = %s
+                                """,
+                                (eqpid, eqptype, action, linegroup, floor, key)
+                            )
 
                 new_eqpids = request.form.getlist('new_EQPID[]')
                 new_eqptypes = request.form.getlist('new_EQPTYPE[]')
