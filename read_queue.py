@@ -620,32 +620,39 @@ def update_equipments():
             pgConnect.set_current_user(conn, current_user)
 
             with conn.cursor() as cur:
-                cur.execute("SELECT eqpid FROM equipments")
-                existing_ids = [row[0] for row in cur.fetchall()]
+                cur.execute("SELECT eqpid, eqptype, testerip, proberip, linegroup, floor, action FROM equipments")
+                existing_map = {
+                    row[0]: (row[1] or '', row[2] or '', row[3] or '', row[4] or '', row[5] or '', row[6] or '')
+                    for row in cur.fetchall()
+                }
+                existing_ids = list(existing_map.keys())
 
                 for key in existing_ids:
                     if request.form.get(f'delete_{key}'):
                         cur.execute("DELETE FROM equipments WHERE eqpid = %s", (key,))
                         continue
 
-                    eqptype = request.form.get(f'EQPTYPE_{key}', '')
-                    testerip = request.form.get(f'TESTERIP_{key}', '')
-                    proberip = request.form.get(f'PROBERIP_{key}', '')
-                    linegroup = request.form.get(f'LINEGROUP_{key}', '')
-                    floor = request.form.get(f'floor_{key}', '')
-                    action = request.form.get(f'ACTION_{key}', '')
+                    eqptype = request.form.get(f'EQPTYPE_{key}', '').strip()
+                    testerip = request.form.get(f'TESTERIP_{key}', '').strip()
+                    proberip = request.form.get(f'PROBERIP_{key}', '').strip()
+                    linegroup = request.form.get(f'LINEGROUP_{key}', '').strip()
+                    floor = request.form.get(f'floor_{key}', '').strip()
+                    action = request.form.get(f'ACTION_{key}', '').strip()
 
                     if eqptype and testerip and proberip and linegroup and floor and action:
-                        cur.execute(
-                            """
-                            UPDATE equipments
-                               SET eqptype = %s, testerip = %s, proberip = %s,
-                                   linegroup = %s, floor = %s, action = %s,
-                                   updated_at = now()
-                             WHERE eqpid = %s
-                            """,
-                            (eqptype, testerip, proberip, linegroup, floor, action, key)
-                        )
+                        new_vals = (eqptype, testerip, proberip, linegroup, floor, action)
+                        old_vals = existing_map.get(key)
+                        if old_vals != new_vals:
+                            cur.execute(
+                                """
+                                UPDATE equipments
+                                   SET eqptype = %s, testerip = %s, proberip = %s,
+                                       linegroup = %s, floor = %s, action = %s,
+                                       updated_at = now()
+                                 WHERE eqpid = %s
+                                """,
+                                (eqptype, testerip, proberip, linegroup, floor, action, key)
+                            )
 
                 new_eqpids = request.form.getlist('new_EQPID[]')
                 new_eqptypes = request.form.getlist('new_EQPTYPE[]')
