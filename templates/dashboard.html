@@ -202,6 +202,10 @@ function shortName(name) {
     .replace('_log', '');
 }
 
+function queueTargetUrl(name) {
+  return `/?queue_name=${encodeURIComponent(name)}`;
+}
+
 function badgeClass(status) {
   const map = { idle:'badge-idle', busy:'badge-busy',
                 ghost:'badge-ghost', offline:'badge-offline' };
@@ -408,7 +412,7 @@ function renderQueueList(stats) {
 
     return `
       <div class="flex items-center gap-2 cursor-pointer hover:bg-gray-50 rounded px-1 py-0.5"
-           onclick="window.location.href='/?queue_name=${s.name}'">
+           onclick="window.location.href='${queueTargetUrl(s.name)}'">
         <span class="text-xs font-mono w-28 shrink-0 truncate text-gray-700"
               title="${s.name}">${shortName(s.name)}</span>
         <div class="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
@@ -518,8 +522,10 @@ function renderChart(chartData) {
 // ── 資料更新 ──────────────────────────────────────────────────
 async function refresh() {
   const cat = document.getElementById('category-select').value;
+  const params = new URLSearchParams(window.location.search);
+  params.set('category', cat);
   try {
-    const res  = await fetch(`/dashboard_data?category=${cat}`);
+    const res  = await fetch(`/dashboard_data?${params.toString()}`);
     if (!res.ok) return;
     const data = await res.json();
 

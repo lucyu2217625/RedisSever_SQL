@@ -100,7 +100,7 @@
             <button type="button" id="toggle-status-edit-btn" onclick="toggleStatusEdit()" class="btn-secondary btn-sm">
                 <i class="fas fa-pen mr-1"></i>編輯狀態
             </button>
-            {% elif user_role == 'admin' %}
+            {% elif user_role == 'admin' and not is_history_queue %}
             <div id="delete-init-container">
                 <button type="button" onclick="showDeleteActions()" class="btn-danger-subtle btn-sm">
                     <i class="fas fa-trash-alt mr-1"></i>刪除
@@ -132,7 +132,7 @@
                 <table class="w-full text-left border-collapse">
                     <thead>
                         <tr class="bg-white border-b border-gray-100 text-xs font-semibold text-gray-600">
-                            {% if user_role == 'admin' and not is_worker_status_queue %}
+                            {% if user_role == 'admin' and not is_worker_status_queue and not is_history_queue %}
                             <th class="p-4 w-10 delete-checkbox hidden">
                                 <input type="checkbox" onclick="toggleAll(this)" class="rounded text-blue-600 focus:ring-blue-500">
                             </th>
@@ -145,7 +145,7 @@
                         {% if is_hash %}
                             {% for key, status in hash_data.items() %}
                             <tr class="hover:bg-gray-50 transition-colors">
-                                {% if user_role == 'admin' and not is_worker_status_queue %}
+                                {% if user_role == 'admin' and not is_worker_status_queue and not is_history_queue %}
                                 <td class="p-4 delete-checkbox hidden">
                                     <input type="checkbox" name="selected_items[]" value="{{ key }}" class="rounded text-blue-600 focus:ring-blue-500">
                                 </td>
@@ -175,7 +175,7 @@
                         {% else %}
                             {% for item in queue_data %}
                             <tr class="hover:bg-gray-50 transition-colors">
-                                {% if user_role == 'admin' %}
+                                {% if user_role == 'admin' and not is_history_queue %}
                                 <td class="p-4 delete-checkbox hidden">
                                     <input type="checkbox" name="selected_items[]" value="{{ item.raw }}" class="rounded text-blue-600 focus:ring-blue-500">
                                 </td>

@@ -2,3 +2,4 @@ flask==2.0.1
 redis==4.0.2
 werkzeug==2.0
 requests
+psycopg2-binary==2.9.9
