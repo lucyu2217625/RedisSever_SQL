@@ -96,7 +96,10 @@
                    class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'contacts' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
                     <i class="fas fa-address-book mr-1"></i>聯絡人
                 </a>
-
+                <a href="{{ url_for('equipment_history') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'equipment_history' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-history mr-1"></i>設備異動紀錄
+                </a>
                 <a href="{{ url_for('register') }}"
                    class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'register' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
                     <i class="fas fa-users-cog mr-1"></i>帳號管理
