@@ -3,8 +3,6 @@ import redis
 import json
 import os
 import redisConnect
-import pgConnect
-import psycopg2.extras
 import threading
 from redis.exceptions import RedisError, ConnectionError
 from functools import wraps
@@ -42,20 +40,12 @@ def safe_parse_datetime(dt_str):
 redisConnect.connect_to_master()
 threading.Thread(target=redisConnect.listen_for_failover, daemon=True).start()
 
-pgConnect.connect_to_pg()
-
 def init_admin_user():
     try:
-        with pgConnect.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM users WHERE username = %s", ('admin',))
-                if cur.fetchone() is None:
-                    hashed = generate_password_hash('admin123')
-                    cur.execute(
-                        "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
-                        ('admin', hashed, 'admin')
-                    )
-                    print("Default admin user created.")
+        if not redisConnect.redis_master.hexists('users', 'admin'):
+            hashed = generate_password_hash('admin123')
+            redisConnect.redis_master.hset('users', 'admin', f'{hashed}:admin')
+            print("Default admin user created.")
     except Exception as e:
         print(f"Error initializing admin user: {e}")
 
@@ -107,23 +97,24 @@ def role_required(role):
                 # flash('請先登入', 'error')
                 return redirect(url_for('login'))
             try:
-                with pgConnect.get_conn() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT role FROM users WHERE username = %s", (session['username'],))
-                        row = cur.fetchone()
-                if not row:
+                user_data = redisConnect.redis_master.hget('users', session['username'])
+                if not user_data:
                     flash('使用者資料不存在', 'error')
                     return redirect(url_for('login'))
-                user_role = row[0]
+                user_role = user_data.rsplit(':',1)[1] if user_data and ':' in user_data else 'viewer'
                 if user_role != role:
                     flash('您沒有權限執行此操作', 'error')
                     return redirect(url_for('index'))
                 return f(*args, **kwargs)
-            except Exception as e:
+            except (RedisError, ConnectionError) as e:
                 flash('無法連接到資料庫，請稍後再試', 'error')
                 return redirect(url_for('login'))
         return decorated_function
     return decorator
+
+# 登入暴力破解防護設定
+LOGIN_MAX_ATTEMPTS = 5          # 連續失敗幾次後鎖定
+LOGIN_LOCKOUT_SECONDS = 300     # 鎖定時間（秒），這裡設 5 分鐘
 
 # 登入頁面
 @app.route('/login', methods=['GET', 'POST'])
@@ -132,26 +123,46 @@ def login():
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '').strip()
 
+        # 帳號名稱本身也拿來當 Redis key 的一部分，先做基本清洗避免奇怪字元污染 key
+        safe_username = username.replace(' ', '_')
+        lock_key = f'login_lock:{safe_username}'
+        fail_key = f'login_fail:{safe_username}'
+
         try:
-            with pgConnect.get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT password_hash, role FROM users WHERE username = %s",
-                        (username,)
-                    )
-                    row = cur.fetchone()
-            if row:
-                stored_hash, stored_role = row
+            # 若帳號已被鎖定，直接擋下，不查密碼、不判斷帳號是否存在
+            if username and redisConnect.redis_master.exists(lock_key):
+                ttl = redisConnect.redis_master.ttl(lock_key)
+                ttl = ttl if ttl and ttl > 0 else LOGIN_LOCKOUT_SECONDS
+                return render_template(
+                    'login.html',
+                    error=f'嘗試次數過多，請於 {ttl} 秒後再試'
+                )
+
+            user_data = redisConnect.redis_master.hget('users', username)
+            if user_data and ':' in user_data:
+                stored_hash, stored_role = user_data.rsplit(':', 1)  # 改這一行！
                 if check_password_hash(stored_hash, password):
+                    # 登入成功，清除該帳號先前的失敗紀錄
+                    redisConnect.redis_master.delete(fail_key)
                     session['username'] = username
                     session['role'] = stored_role
                     # flash('登入成功！', 'success')
                     return redirect(url_for('index'))
-                else:
-                    return render_template('login.html', error=f'使用者名稱或密碼錯誤')
-            else:
-                return render_template('login.html', error='使用者名稱或密碼錯誤')
-        except Exception:
+
+            # 走到這裡代表帳號不存在或密碼錯誤，統一視為「登入失敗」累加次數
+            # 訊息刻意不區分「帳號不存在」或「密碼錯誤」，避免被拿來列舉合法帳號
+            if username:
+                fails = redisConnect.redis_master.incr(fail_key)
+                redisConnect.redis_master.expire(fail_key, LOGIN_LOCKOUT_SECONDS)
+                if fails >= LOGIN_MAX_ATTEMPTS:
+                    redisConnect.redis_master.set(lock_key, '1', ex=LOGIN_LOCKOUT_SECONDS)
+                    return render_template(
+                        'login.html',
+                        error=f'嘗試次數過多，帳號已鎖定 {LOGIN_LOCKOUT_SECONDS // 60} 分鐘'
+                    )
+
+            return render_template('login.html', error='使用者名稱或密碼錯誤')
+        except (RedisError, ConnectionError):
             return render_template('login.html', error='無法連接到資料庫，請稍後再試')
 
     return render_template('login.html')
@@ -184,7 +195,6 @@ def index():
         per_page = 10
     is_hash = False
     hash_data = {}
-    is_history_queue = False
     user_role = session.get('role', 'viewer')
     total_pages = 1 # Initialize total_pages here
 
@@ -195,13 +205,7 @@ def index():
 
     available_queues = ALLOWED_QUEUES
 
-    history_view = load_history_queue(queue_name, page, per_page) if queue_name else None
-    if history_view:
-        queue_data = history_view['queue_data']
-        queue_length = history_view['queue_length']
-        total_pages = history_view['total_pages'] or 1
-        is_history_queue = True
-    elif queue_name in ALLOWED_QUEUES:
+    if queue_name in ALLOWED_QUEUES:
         try:
             if redisConnect.redis_master.exists(queue_name):
                 key_type = redisConnect.type(queue_name)
@@ -282,7 +286,6 @@ def index():
         per_page=per_page,
         is_hash=is_hash,
         hash_data=hash_data,
-        is_history_queue=is_history_queue,
         user_role=user_role,
         active_page='index'
     )
@@ -292,80 +295,6 @@ def parse_json(item):
         return json.loads(item)
     except json.JSONDecodeError:
         return item
-
-
-def history_queue_spec(queue_name):
-    for suffix, status in (
-        ('_dispatched_log', 'dispatched'),
-        ('_failed_queue', 'failed'),
-    ):
-        if queue_name.endswith(suffix):
-            return queue_name[:-len(suffix)], status
-    return None, None
-
-
-def normalize_history_row(row):
-    payload = row.get('payload') or {}
-    if not isinstance(payload, dict):
-        payload = {'payload': payload}
-
-    dispatch_time = row.get('dispatch_time')
-    if isinstance(dispatch_time, datetime):
-        dispatch_time = dispatch_time.astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')
-
-    display = dict(payload)
-    display.update({
-        'category': row.get('category'),
-        'task_id': row.get('task_id'),
-        'status': row.get('status'),
-        'rpa_worker': row.get('rpa_worker'),
-        'dispatch_time': dispatch_time,
-    })
-
-    return {
-        'parsed': display,
-        'raw': json.dumps(display, ensure_ascii=False),
-    }
-
-
-def load_history_queue(queue_name, page, per_page):
-    category, status = history_queue_spec(queue_name)
-    if not category:
-        return None
-
-    offset = (page - 1) * per_page
-    with pgConnect.get_conn() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT count(*) AS cnt
-                FROM task_history
-                WHERE category = %s AND status = %s
-                """,
-                (category, status)
-            )
-            total = cur.fetchone()['cnt']
-
-            cur.execute(
-                """
-                SELECT category, task_id, status, rpa_worker, dispatch_time, payload
-                FROM task_history
-                WHERE category = %s AND status = %s
-                ORDER BY dispatch_time DESC, id DESC
-                LIMIT %s OFFSET %s
-                """,
-                (category, status, per_page, offset)
-            )
-            rows = cur.fetchall()
-
-    queue_data = [normalize_history_row(row) for row in rows]
-    total_pages = (total + per_page - 1) // per_page if total else 0
-    return {
-        'queue_data': queue_data,
-        'queue_length': total,
-        'total_pages': total_pages,
-        'is_history_queue': True,
-    }
 
 @app.route('/download')
 @login_required
@@ -377,10 +306,7 @@ def download():
 
     try:
         data = []
-        history_view = load_history_queue(queue_name, 1, 1000000) if queue_name else None
-        if history_view:
-            data = [item['parsed'] for item in history_view['queue_data']]
-        elif redisConnect.redis_master.exists(queue_name):
+        if redisConnect.redis_master.exists(queue_name):
             key_type = redisConnect.type(queue_name)
             if key_type == 'list':
                 # Since decode_responses=True, lrange returns list of strings
@@ -423,10 +349,6 @@ def delete_selected():
     if not queue_name:
         flash("缺少佇列名稱", "error")
         return redirect(url_for('index'))
-
-    if history_queue_spec(queue_name)[0]:
-        flash("歷史紀錄頁面僅供查詢與下載，不能刪除。", "error")
-        return redirect(url_for('index', queue_name=queue_name))
 
     try:
         if delete_all_force:
@@ -514,6 +436,7 @@ def update_status():
     return redirect(url_for("index", queue_name=queue_name))
 
 @app.route("/queue_lengths")
+@login_required
 def queue_lengths():
     grouped_queues = {}
 
@@ -535,6 +458,7 @@ def queue_lengths():
     return render_template("queue_lengths.html", grouped_queues=grouped_queues, active_page='queue_lengths')
 
 @app.route("/queue_lengths_partial")
+@login_required
 def queue_lengths_partial():
     grouped_queues = {}
     for q in ALLOWED_QUEUES:
@@ -576,10 +500,12 @@ def queue_lengths_partial():
     return jsonify(tbodies)
 
 @app.route("/worker_status")
+@login_required
 def worker_status():
     return render_template("worker_status.html", active_page='worker_status')
 
 @app.route("/worker_status_partial")
+@login_required
 def worker_status_partial():
     import json
     queues = ["prober_worker_status", "LineNotify_worker_status", "LotActions_worker_status"]
@@ -610,127 +536,65 @@ def worker_status_partial():
 
 @app.route('/update_equipments', methods=['POST'])
 @login_required
+@role_required('admin')
 def update_equipments():
+    queue_name = 'equipments'
     edit_mode = request.form.get('edit_mode', '0')
-    current_user = session.get('username', '')
 
     if edit_mode == '1':
-        with pgConnect.get_conn() as conn:
-            # 讓 equipment_history 的 trigger 記得是誰做的異動
-            pgConnect.set_current_user(conn, current_user)
+        for key in redisConnect.redis_master.hkeys(queue_name):
+            if request.form.get(f'delete_{key}'):
+                redisConnect.redis_master.hdel(queue_name, key)
+                continue
 
-            with conn.cursor() as cur:
-                cur.execute("SELECT eqpid, eqptype, testerip, proberip, linegroup, floor, action FROM equipments")
-                existing_map = {
-                    row[0]: (row[1] or '', row[2] or '', row[3] or '', row[4] or '', row[5] or '', row[6] or '')
-                    for row in cur.fetchall()
+            eqptype = request.form.get(f'EQPTYPE_{key}', '')
+            testerip = request.form.get(f'TESTERIP_{key}', '')
+            proberip = request.form.get(f'PROBERIP_{key}', '')
+            linegroup = request.form.get(f'LINEGROUP_{key}', '')
+            floor = request.form.get(f'floor_{key}', '')
+            action = request.form.get(f'ACTION_{key}', '')
+
+            if eqptype and testerip and proberip and linegroup and floor and action:
+                data = {
+                    'EQPTYPE': eqptype,
+                    'TESTERIP': testerip,
+                    'PROBERIP': proberip,
+                    'LINEGROUP': linegroup,
+                    'floor': floor,
+                    'Action': action
                 }
-                existing_ids = list(existing_map.keys())
+                redisConnect.redis_master.hset(queue_name, key, json.dumps(data))
 
-                for key in existing_ids:
-                    if request.form.get(f'delete_{key}'):
-                        cur.execute("DELETE FROM equipments WHERE eqpid = %s", (key,))
-                        continue
+        new_eqpids = request.form.getlist('new_EQPID[]')
+        new_eqptypes = request.form.getlist('new_EQPTYPE[]')
+        new_testerips = request.form.getlist('new_TESTERIP[]')
+        new_proberips = request.form.getlist('new_PROBERIP[]')
+        new_linegroups = request.form.getlist('new_LINEGROUP[]')
+        new_floors = request.form.getlist('new_floor[]')
+        new_actions = request.form.getlist('new_ACTION[]') # Add this line
 
-                    eqptype = request.form.get(f'EQPTYPE_{key}', '').strip()
-                    testerip = request.form.get(f'TESTERIP_{key}', '').strip()
-                    proberip = request.form.get(f'PROBERIP_{key}', '').strip()
-                    linegroup = request.form.get(f'LINEGROUP_{key}', '').strip()
-                    floor = request.form.get(f'floor_{key}', '').strip()
-                    action = request.form.get(f'ACTION_{key}', '').strip()
+        for i in range(len(new_eqpids)):
+            eqpid = new_eqpids[i].strip()
+            if not eqpid:
+                continue
+            if redisConnect.redis_master.hexists(queue_name, eqpid):
+                continue
 
-                    if eqptype and testerip and proberip and linegroup and floor and action:
-                        new_vals = (eqptype, testerip, proberip, linegroup, floor, action)
-                        old_vals = existing_map.get(key)
-                        if old_vals != new_vals:
-                            cur.execute(
-                                """
-                                UPDATE equipments
-                                   SET eqptype = %s, testerip = %s, proberip = %s,
-                                       linegroup = %s, floor = %s, action = %s,
-                                       updated_at = now()
-                                 WHERE eqpid = %s
-                                """,
-                                (eqptype, testerip, proberip, linegroup, floor, action, key)
-                            )
-
-                new_eqpids = request.form.getlist('new_EQPID[]')
-                new_eqptypes = request.form.getlist('new_EQPTYPE[]')
-                new_testerips = request.form.getlist('new_TESTERIP[]')
-                new_proberips = request.form.getlist('new_PROBERIP[]')
-                new_linegroups = request.form.getlist('new_LINEGROUP[]')
-                new_floors = request.form.getlist('new_floor[]')
-                new_actions = request.form.getlist('new_ACTION[]')
-
-                for i in range(len(new_eqpids)):
-                    eqpid = new_eqpids[i].strip()
-                    if not eqpid or eqpid in existing_ids:
-                        continue
-
-                    if (new_eqptypes[i].strip() and new_testerips[i].strip() and
-                            new_proberips[i].strip() and new_linegroups[i].strip() and
-                            new_floors[i].strip() and new_actions[i].strip()):
-                        cur.execute(
-                            """
-                            INSERT INTO equipments (eqpid, eqptype, testerip, proberip, linegroup, floor, action)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
-                            """,
-                            (
-                                eqpid,
-                                new_eqptypes[i].strip(),
-                                new_testerips[i].strip(),
-                                new_proberips[i].strip(),
-                                new_linegroups[i].strip(),
-                                new_floors[i].strip(),
-                                new_actions[i].strip(),
-                            )
-                        )
+            if (new_eqptypes[i].strip() and new_testerips[i].strip() and 
+                new_proberips[i].strip() and new_linegroups[i].strip() and 
+                new_floors[i].strip() and new_actions[i].strip()): # Add new_actions[i].strip() to condition
+                data = {
+                    'EQPTYPE': new_eqptypes[i].strip(),
+                    'TESTERIP': new_testerips[i].strip(),
+                    'PROBERIP': new_proberips[i].strip(),
+                    'LINEGROUP': new_linegroups[i].strip(),
+                    'floor': new_floors[i].strip(),
+                    'Action': new_actions[i].strip() # Add this line
+                }
+                redisConnect.redis_master.hset(queue_name, eqpid, json.dumps(data))
         return redirect(url_for("equipments"))
 
     return redirect(url_for("equipments"))
-
-
-@app.route('/equipment_history')
-@login_required
-def equipment_history():
-    """查看單一 EQPID 的異動紀錄（equipment_history 表由 PostgreSQL trigger 自動寫入）"""
-    eqpid = request.args.get('eqpid', '').strip()
-    history = []
-    error = None
-    try:
-        with pgConnect.get_conn() as conn:
-            with pgConnect.dict_cursor(conn) as cur:
-                if eqpid:
-                    cur.execute(
-                        """
-                        SELECT * FROM equipment_history
-                         WHERE eqpid = %s
-                         ORDER BY changed_at DESC
-                         LIMIT 200
-                        """,
-                        (eqpid,)
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT * FROM equipment_history
-                         ORDER BY changed_at DESC
-                         LIMIT 200
-                        """
-                    )
-                history = cur.fetchall()
-        if not history:
-            error = "沒有找到異動紀錄。"
-    except Exception as e:
-        error = f"查詢失敗：{e}"
-
-    return render_template(
-        'equipment_history.html',
-        history=history,
-        eqpid=eqpid,
-        error=error,
-        active_page='equipment_history'
-    )
 
 @app.route('/register', methods=['GET', 'POST'])
 @role_required('admin')
@@ -739,29 +603,20 @@ def register():
         username = request.form['username']
         password = request.form['password']
         role = request.form['role']
-        try:
-            with pgConnect.get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
-                    if cur.fetchone():
-                        flash('使用者已存在', 'error')
-                    else:
-                        hashed = generate_password_hash(password)
-                        cur.execute(
-                            "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s)",
-                            (username, hashed, role)
-                        )
-                        flash('使用者新增成功', 'success')
-        except Exception as e:
-            flash(f'新增失敗：{e}', 'error')
+        if redisConnect.redis_master.hexists('users', username):
+            flash('使用者已存在', 'error')
+        else:
+            hashed = generate_password_hash(password)
+            redisConnect.redis_master.hset('users', username, f'{hashed}:{role}')
+            flash('使用者新增成功', 'success')
         return redirect(url_for('register'))
 
     # 回傳目前所有使用者
     user_list = []
-    with pgConnect.get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT username, role FROM users ORDER BY username")
-            user_list = [{'username': u, 'role': r} for u, r in cur.fetchall()]
+    all_users = redisConnect.redis_master.hgetall('users')
+    for uname, udata in all_users.items():
+        role = udata.rsplit(':', 1)[-1]
+        user_list.append({'username': uname, 'role': role})
 
     return render_template('register.html', user_list=user_list, active_page='register')
 
@@ -773,9 +628,7 @@ def delete_user():
     if username == 'admin':
         flash('不能刪除 admin 使用者', 'error')
     else:
-        with pgConnect.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM users WHERE username = %s", (username,))
+        redisConnect.redis_master.hdel('users', username)
         flash(f'{username} 已刪除', 'success')
     return redirect(url_for('register'))
 
@@ -793,72 +646,63 @@ def update_user_password():
         flash('新密碼不可為空', 'error')
         return redirect(url_for('register'))
 
-    with pgConnect.get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
-            if cur.fetchone() is None:
-                flash('使用者不存在', 'error')
-                return redirect(url_for('register'))
+    user_data = redisConnect.redis_master.hget('users', username)
+    if not user_data or ':' not in user_data:
+        flash('使用者不存在', 'error')
+        return redirect(url_for('register'))
 
-            hashed = generate_password_hash(new_password)
-            cur.execute(
-                "UPDATE users SET password_hash = %s WHERE username = %s",
-                (hashed, username)
-            )
+    role = user_data.rsplit(':', 1)[-1]
+    hashed = generate_password_hash(new_password)
+    redisConnect.redis_master.hset('users', username, f'{hashed}:{role}')
     flash(f'{username} 的密碼已更新', 'success')
     return redirect(url_for('register'))
 
 
 @app.route('/equipments', methods=['GET', 'POST'])
+@login_required
 def equipments():
     error = None
-    # hash_data 維持跟 Jinja 樣板相同的結構：{eqpid: json字串}，
-    # 這樣 equipments.html 裡原本的 |from_json 樣板邏輯不用改
     hash_data = {}
     user_role = session.get('role', 'viewer')
 
     # Get filter criteria from request args, converting to uppercase for case-insensitive matching
-    filter_floor = request.args.get('floor', '').strip()
-    filter_eqptype = request.args.get('eqptype', '').strip()
-    filter_eqpid = request.args.get('eqpid', '').strip()
+    filter_floor = request.args.get('floor', '').strip().upper()
+    filter_eqptype = request.args.get('eqptype', '').strip().upper()
+    filter_eqpid = request.args.get('eqpid', '').strip().upper() # Add this line
 
     try:
-        conditions = []
-        params = []
-        if filter_floor:
-            conditions.append("floor ILIKE %s")
-            params.append(filter_floor)
-        if filter_eqptype:
-            conditions.append("eqptype ILIKE %s")
-            params.append(filter_eqptype)
-        if filter_eqpid:
-            conditions.append("eqpid ILIKE %s")
-            params.append(filter_eqpid)
-
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
-        with pgConnect.get_conn() as conn:
-            with pgConnect.dict_cursor(conn) as cur:
-                cur.execute(f"SELECT * FROM equipments {where_clause} ORDER BY eqpid", params)
-                rows = cur.fetchall()
-
-        for row in rows:
-            hash_data[row['eqpid']] = json.dumps({
-                'EQPTYPE': row['eqptype'],
-                'TESTERIP': row['testerip'],
-                'PROBERIP': row['proberip'],
-                'LINEGROUP': row['linegroup'],
-                'floor': row['floor'],
-                'Action': row['action'],
-            }, ensure_ascii=False)
-
-        if not hash_data and (filter_floor or filter_eqptype or filter_eqpid):
-            error = "沒有找到符合篩選條件的資料。"
-        elif not hash_data:
+        if not redisConnect.redis_master.exists('equipments'):
             error = "「equipments」沒有內容。"
+            hash_data = {}
+        else:
+            all_hash_data = redisConnect.redis_master.hgetall('equipments')
+            
+            if not filter_floor and not filter_eqptype and not filter_eqpid:
+                hash_data = all_hash_data
+            else:
+                hash_data = {} # Initialize hash_data here for the filtered results
+                for key, val_str in all_hash_data.items():
+                    try:
+                        data = json.loads(val_str)
+                        # Assume data is a dict, check if it matches filter criteria
+                        floor_match = not filter_floor or data.get('floor', '').upper() == filter_floor
+                        eqptype_match = not filter_eqptype or data.get('EQPTYPE', '').upper() == filter_eqptype
+                        eqpid_match = not filter_eqpid or key.upper() == filter_eqpid # EQPID is the key itself
+                        
+                        if floor_match and eqptype_match and eqpid_match:
+                            hash_data[key] = val_str
+                    except (json.JSONDecodeError, AttributeError):
+                        # Skip entries that are not valid JSON or not dicts
+                        continue
 
-    except Exception as e:
+            if not hash_data and (filter_floor or filter_eqptype or filter_eqpid):
+                 error = "沒有找到符合篩選條件的資料。"
+            elif not hash_data:
+                error = "「equipments」沒有內容。"
+
+    except (RedisError, ConnectionError) as e:
         error = "無法連接到資料庫，請稍後再試。"
+        redisConnect.connect_to_master()
         hash_data = {}
 
     return render_template(
@@ -866,9 +710,9 @@ def equipments():
         error=error,
         hash_data=hash_data,
         user_role=user_role,
-        filter_floor=filter_floor,
-        filter_eqptype=filter_eqptype,
-        filter_eqpid=filter_eqpid,
+        filter_floor=request.args.get('floor', '').strip(), # Pass original case back to template
+        filter_eqptype=request.args.get('eqptype', '').strip(),
+        filter_eqpid=request.args.get('eqpid', '').strip(), # Add this line
         active_page='equipments'
     )
 
@@ -953,122 +797,110 @@ def script_update():
 
 @app.route('/update_contacts', methods=['POST'])
 @login_required
+@role_required('admin')
 def update_contacts():
+    queue_name = 'contacts'
     edit_mode = request.form.get('edit_mode', '0')
 
     if edit_mode == '1':
-        with pgConnect.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id, eqpid, eqptype, action, linegroup, floor FROM contacts")
-                existing_map = {
-                    row[0]: (row[1] or '', row[2] or '', row[3] or '', row[4] or '', row[5] or '')
-                    for row in cur.fetchall()
+        for key in redisConnect.redis_master.hkeys(queue_name):
+            if request.form.get(f'delete_{key}'):
+                redisConnect.redis_master.hdel(queue_name, key)
+                continue
+
+            eqpid = request.form.get(f'EQPID_{key}', '')
+            eqptype = request.form.get(f'EQPTYPE_{key}', '')
+            action = request.form.get(f'ACTION_{key}', '')
+            linegroup = request.form.get(f'LINEGROUP_{key}', '')
+            floor = request.form.get(f'floor_{key}', '')
+
+            if eqpid and eqptype and action and linegroup and floor:
+                data = {
+                    'EQPID': eqpid,
+                    'EQPTYPE': eqptype,
+                    'Action': action,
+                    'LINEGROUP': linegroup,
+                    'floor': floor
                 }
-                existing_ids = list(existing_map.keys())
+                redisConnect.redis_master.hset(queue_name, key, json.dumps(data))
 
-                for key in existing_ids:
-                    if request.form.get(f'delete_{key}'):
-                        cur.execute("DELETE FROM contacts WHERE id = %s", (key,))
-                        continue
+        new_eqpids = request.form.getlist('new_EQPID[]')
+        new_eqptypes = request.form.getlist('new_EQPTYPE[]')
+        new_actions = request.form.getlist('new_ACTION[]')
+        new_linegroups = request.form.getlist('new_LINEGROUP[]')
+        new_floors = request.form.getlist('new_floor[]')
 
-                    eqpid = request.form.get(f'EQPID_{key}', '').strip()
-                    eqptype = request.form.get(f'EQPTYPE_{key}', '').strip()
-                    action = request.form.get(f'ACTION_{key}', '').strip()
-                    linegroup = request.form.get(f'LINEGROUP_{key}', '').strip()
-                    floor = request.form.get(f'floor_{key}', '').strip()
+        new_row_count = max(len(new_eqpids), len(new_eqptypes), len(new_actions), len(new_linegroups), len(new_floors))
+        for i in range(new_row_count):
+            eqpid = new_eqpids[i].strip() if i < len(new_eqpids) else ''
+            eqptype = new_eqptypes[i].strip() if i < len(new_eqptypes) else ''
+            action = new_actions[i].strip() if i < len(new_actions) else ''
+            linegroup = new_linegroups[i].strip() if i < len(new_linegroups) else ''
+            floor = new_floors[i].strip() if i < len(new_floors) else ''
 
-                    if eqpid and eqptype and action and linegroup and floor:
-                        new_vals = (eqpid, eqptype, action, linegroup, floor)
-                        old_vals = existing_map.get(key)
-                        if old_vals != new_vals:
-                            cur.execute(
-                                """
-                                UPDATE contacts
-                                   SET eqpid = %s, eqptype = %s, action = %s,
-                                       linegroup = %s, floor = %s
-                                 WHERE id = %s
-                                """,
-                                (eqpid, eqptype, action, linegroup, floor, key)
-                            )
-
-                new_eqpids = request.form.getlist('new_EQPID[]')
-                new_eqptypes = request.form.getlist('new_EQPTYPE[]')
-                new_actions = request.form.getlist('new_ACTION[]')
-                new_linegroups = request.form.getlist('new_LINEGROUP[]')
-                new_floors = request.form.getlist('new_floor[]')
-
-                new_row_count = max(len(new_eqpids), len(new_eqptypes), len(new_actions), len(new_linegroups), len(new_floors), default=0)
-                for i in range(new_row_count):
-                    eqpid = new_eqpids[i].strip() if i < len(new_eqpids) else ''
-                    eqptype = new_eqptypes[i].strip() if i < len(new_eqptypes) else ''
-                    action = new_actions[i].strip() if i < len(new_actions) else ''
-                    linegroup = new_linegroups[i].strip() if i < len(new_linegroups) else ''
-                    floor = new_floors[i].strip() if i < len(new_floors) else ''
-
-                    if all(not value for value in [eqpid, floor, eqptype, action, linegroup]):
-                        continue
-
-                    # id 由 PostgreSQL 的 SERIAL 自動產生，不用再手動 INCR
-                    cur.execute(
-                        """
-                        INSERT INTO contacts (eqpid, eqptype, action, linegroup, floor)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (eqpid, eqptype, action, linegroup, floor)
-                    )
-
+            if all(not value for value in [eqpid, floor, eqptype, action, linegroup]):
+                continue
+            
+            new_id = redisConnect.redis_master.incr('contacts_id_counter')
+            data = {
+                'EQPID': eqpid,
+                'EQPTYPE': eqptype,
+                'Action': action,
+                'LINEGROUP': linegroup,
+                'floor': floor
+            }
+            redisConnect.redis_master.hset(queue_name, new_id, json.dumps(data))
+            
         return redirect(url_for("contacts"))
 
     return redirect(url_for("contacts"))
 
 
 @app.route('/contacts', methods=['GET', 'POST'])
+@login_required
 def contacts():
     error = None
-    # hash_data 維持跟原本一樣的 {id: json字串} 結構，相容原本的 contacts.html 樣板
     hash_data = {}
     user_role = session.get('role', 'viewer')
 
-    filter_floor = request.args.get('floor', '').strip()
-    filter_eqptype = request.args.get('eqptype', '').strip()
-    filter_eqpid = request.args.get('eqpid', '').strip()
+    # Get filter criteria from request args, converting to uppercase for case-insensitive matching
+    filter_floor = request.args.get('floor', '').strip().upper()
+    filter_eqptype = request.args.get('eqptype', '').strip().upper()
+    filter_eqpid = request.args.get('eqpid', '').strip().upper()
 
     try:
-        conditions = []
-        params = []
-        if filter_floor:
-            conditions.append("floor ILIKE %s")
-            params.append(filter_floor)
-        if filter_eqptype:
-            conditions.append("eqptype ILIKE %s")
-            params.append(filter_eqptype)
-        if filter_eqpid:
-            conditions.append("eqpid ILIKE %s")
-            params.append(filter_eqpid)
-
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-
-        with pgConnect.get_conn() as conn:
-            with pgConnect.dict_cursor(conn) as cur:
-                cur.execute(f"SELECT * FROM contacts {where_clause} ORDER BY id", params)
-                rows = cur.fetchall()
-
-        for row in rows:
-            hash_data[str(row['id'])] = json.dumps({
-                'EQPID': row['eqpid'],
-                'EQPTYPE': row['eqptype'],
-                'Action': row['action'],
-                'LINEGROUP': row['linegroup'],
-                'floor': row['floor'],
-            }, ensure_ascii=False)
-
-        if not hash_data and (filter_floor or filter_eqptype or filter_eqpid):
-            error = "沒有找到符合篩選條件的資料。"
-        elif not hash_data:
+        if not redisConnect.redis_master.exists('contacts'):
             error = "「contacts」沒有內容。"
+            hash_data = {}
+        else:
+            all_hash_data = redisConnect.redis_master.hgetall('contacts')
+            
+            if not filter_floor and not filter_eqptype and not filter_eqpid:
+                hash_data = all_hash_data
+            else:
+                hash_data = {} # Initialize hash_data here for the filtered results
+                for key, val_str in all_hash_data.items():
+                    try:
+                        data = json.loads(val_str)
+                        # Assume data is a dict, check if it matches filter criteria
+                        floor_match = not filter_floor or data.get('floor', '').upper() == filter_floor
+                        eqptype_match = not filter_eqptype or data.get('EQPTYPE', '').upper() == filter_eqptype
+                        eqpid_match = not filter_eqpid or data.get('EQPID', '').upper() == filter_eqpid
+                        
+                        if floor_match and eqptype_match and eqpid_match:
+                            hash_data[key] = val_str
+                    except (json.JSONDecodeError, AttributeError):
+                        # Skip entries that are not valid JSON or not dicts
+                        continue
 
-    except Exception as e:
+            if not hash_data and (filter_floor or filter_eqptype or filter_eqpid):
+                 error = "沒有找到符合篩選條件的資料。"
+            elif not hash_data:
+                error = "「contacts」沒有內容。"
+
+    except (RedisError, ConnectionError) as e:
         error = "無法連接到資料庫，請稍後再試。"
+        redisConnect.connect_to_master()
         hash_data = {}
 
     return render_template(
@@ -1076,9 +908,9 @@ def contacts():
         error=error,
         hash_data=hash_data,
         user_role=user_role,
-        filter_floor=filter_floor,
-        filter_eqptype=filter_eqptype,
-        filter_eqpid=filter_eqpid,
+        filter_floor=request.args.get('floor', '').strip(),
+        filter_eqptype=request.args.get('eqptype', '').strip(),
+        filter_eqpid=request.args.get('eqpid', '').strip(),
         active_page='contacts'
     )
 
@@ -1087,7 +919,7 @@ def contacts():
 def queue_history():
     # 限定任務類別
     available_categories = ['LotActions', 'prober', 'LineNotify']
-
+    
     category = request.args.get('category', '').strip()
     if not category:
         category = available_categories[0]
@@ -1095,8 +927,8 @@ def queue_history():
     # 時間一律固定為 dispatch_time
     time_field = 'dispatch_time'
     worker_name_filter = request.args.get('worker_name', '').strip()
-
-    # 獲取所有 RPA 清單 (worker_status 維持在 Redis，不受這次改動影響)
+    
+    # 獲取所有 RPA 清單 (與 worker_status 來源一致)
     all_rpa_names = set()
     worker_queues = ["prober_worker_status", "LineNotify_worker_status", "LotActions_worker_status"]
     try:
@@ -1109,17 +941,17 @@ def queue_history():
 
     # 時間模式：last (最近) 或 range (區間)
     mode = request.args.get('mode', 'last')
-
+    
     local_tz = timezone(timedelta(hours=8))
     now_dt = datetime.now(tz=local_tz)
-
+    
     if mode == 'range':
         start_str = request.args.get('start_time', '').strip()
         end_str = request.args.get('end_time', '').strip()
         try:
             parsed_start = safe_parse_datetime(start_str)
             cutoff = parsed_start.replace(tzinfo=local_tz) if parsed_start else now_dt - timedelta(hours=24)
-
+            
             parsed_end = safe_parse_datetime(end_str)
             end_dt = parsed_end.replace(tzinfo=local_tz) if parsed_end else now_dt
         except:
@@ -1150,51 +982,63 @@ def queue_history():
 
     if category:
         try:
-            # 定義標籤軸（維持跟原本一樣的顯示格式，方便前端不用改）
+            # 定義標籤軸
             all_labels = []
-            bucket_origin = cutoff.replace(minute=(cutoff.minute // interval_min) * interval_min, second=0, microsecond=0)
-            ptr = bucket_origin
+            ptr = cutoff.replace(minute=(cutoff.minute // interval_min) * interval_min, second=0, microsecond=0)
             while ptr <= end_dt:
                 all_labels.append(ptr.strftime('%m-%d %H:%M'))
                 ptr += timedelta(minutes=interval_min)
 
-            # 用一句 SQL 直接做時間分桶聚合，取代原本把整個 Redis list 撈進 Python 再手動算的寫法。
-            # date_bin 把每一筆 dispatch_time 對齊到 interval_min 分鐘的桶子，直接在資料庫端 GROUP BY。
-            sql = """
-                SELECT
-                    to_char(
-                        date_bin(%(interval)s, dispatch_time, %(origin)s) AT TIME ZONE 'Asia/Taipei',
-                        'MM-DD HH24:MI'
-                    ) AS bucket,
-                    status,
-                    count(*) AS cnt
-                FROM task_history
-                WHERE category = %(category)s
-                  AND dispatch_time BETWEEN %(start)s AND %(end)s
-                  AND (%(worker)s = '' OR rpa_worker = %(worker)s)
-                GROUP BY bucket, status
-            """
-            params = {
-                'interval': timedelta(minutes=interval_min),
-                'origin': bucket_origin,
-                'category': category,
-                'start': cutoff,
-                'end': end_dt,
-                'worker': worker_name_filter,
-            }
+            def get_counts(q_suffix, target_category):
+                potential_keys = [
+                    f"queue_history:{target_category}_{q_suffix}",
+                    f"{target_category}_{q_suffix}",
+                    q_suffix
+                ]
+                raw_items = []
+                for k in potential_keys:
+                    if redisConnect.redis_master.exists(k):
+                        raw_items = redisConnect.redis_master.lrange(k, 0, -1)
+                        if raw_items: break
+                
+                if not raw_items: return defaultdict(int), 0
+                
+                bucket = defaultdict(int)
+                count_sum = 0
+                for raw in raw_items:
+                    try:
+                        item = json.loads(raw)
+                        if isinstance(item, dict) and item.get('task_id') == '__INIT__': continue
+                        if item.get('task_type') and item.get('task_type') != target_category: continue
+                        
+                        # RPA 名稱篩選
+                        if worker_name_filter:
+                            actual_worker = item.get('RPA_worker_name') or item.get('assigned_bot')
+                            if actual_worker != worker_name_filter:
+                                continue
 
-            disp_bucket = defaultdict(int)
-            fail_bucket = defaultdict(int)
-            with pgConnect.get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql, params)
-                    for bucket_label, status, cnt in cur.fetchall():
-                        if status == 'dispatched':
-                            disp_bucket[bucket_label] += cnt
-                            total_dispatched += cnt
-                        elif status == 'failed':
-                            fail_bucket[bucket_label] += cnt
-                            total_failed += cnt
+                        ts_val = item.get(time_field)
+                        if ts_val is None: ts_val = item.get('timestamp')
+                        if ts_val is None: continue
+                        
+                        if isinstance(ts_val, (int, float)):
+                            dt = datetime.fromtimestamp(ts_val, tz=local_tz)
+                        else:
+                            dt = safe_parse_datetime(str(ts_val))
+                            if dt is None: continue # 無法解析則跳過
+                            dt = dt.replace(tzinfo=local_tz) if dt.tzinfo is None else dt.astimezone(local_tz)
+                        
+                        if dt < cutoff or dt > end_dt: continue
+                        
+                        minute_rounded = (dt.minute // interval_min) * interval_min
+                        bk = dt.replace(minute=minute_rounded, second=0, microsecond=0).strftime('%m-%d %H:%M')
+                        bucket[bk] += 1
+                        count_sum += 1
+                    except: continue
+                return bucket, count_sum
+
+            disp_bucket, total_dispatched = get_counts("dispatched_log", category)
+            fail_bucket, total_failed = get_counts("failed_queue", category)
 
             chart_data = {
                 'labels': all_labels,
@@ -1204,6 +1048,7 @@ def queue_history():
 
         except Exception as e:
             error = f"查詢失敗：{str(e)}"
+            redisConnect.connect_to_master()
 
     if request.headers.get('X-Requested-With') == 'XMLHttpRequest':
         if error: return jsonify({'error': error}), 400
@@ -1239,13 +1084,11 @@ def api_trigger():
     EXTERNAL_API_BASE = "http://10.97.210.35:8000"
     user_role = session.get('role', 'viewer')
     
-    # 獲取所有機台編號供下拉選單使用（equipments 已搬到 PostgreSQL）
+    # 獲取所有機台編號供下拉選單使用
     eqp_list = []
     try:
-        with pgConnect.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT eqpid FROM equipments ORDER BY eqpid")
-                eqp_list = [row[0] for row in cur.fetchall()]
+        if redisConnect.redis_master.exists('equipments'):
+            eqp_list = sorted(redisConnect.redis_master.hkeys('equipments'))
     except: pass
 
     if request.method == 'POST':
@@ -1297,26 +1140,8 @@ def dashboard_data():
     """Dashboard 用的單一聚合 API，前端每 5 秒輪詢一次"""
     local_tz = timezone(timedelta(hours=8))
     now_dt   = datetime.now(tz=local_tz)
-    mode = request.args.get('mode', 'last')
-    if mode == 'range':
-        parsed_start = safe_parse_datetime(request.args.get('start_time', '').strip())
-        parsed_end = safe_parse_datetime(request.args.get('end_time', '').strip())
-        cutoff = parsed_start.replace(tzinfo=local_tz) if parsed_start else now_dt - timedelta(hours=6)
-        end_dt = parsed_end.replace(tzinfo=local_tz) if parsed_end else now_dt
-    else:
-        try:
-            hours = int(request.args.get('hours', 6))
-        except ValueError:
-            hours = 6
-        cutoff = now_dt - timedelta(hours=hours)
-        end_dt = now_dt
-
-    try:
-        interval_min = int(request.args.get('interval', 30))
-    except ValueError:
-        interval_min = 30
-    if interval_min not in [10, 30, 60]:
-        interval_min = 30
+    cutoff   = now_dt - timedelta(hours=6)   # 趨勢圖固定顯示最近 6 小時
+    interval_min = 30                         # 每 30 分鐘一個資料點
 
     # ── 1. Queue 長度 ──────────────────────────────────────────
     queue_stats = []
@@ -1330,38 +1155,15 @@ def dashboard_data():
         "prober_task_queue",
         "prober_failed_queue",
     ]
-    history_counts = defaultdict(int)
-    try:
-        with pgConnect.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT category, status, count(*)
-                    FROM task_history
-                    GROUP BY category, status
-                    """
-                )
-                for category_name, status, cnt in cur.fetchall():
-                    history_counts[(category_name, status)] = cnt
-    except Exception:
-        pass
-
+    # 只取 ALLOWED_QUEUES 裡有的
     for q in monitored_queues:
-        length = 0
-        if q.endswith('_dispatched_log') or q.endswith('_failed_queue'):
-            if q.endswith('_dispatched_log'):
-                category_name = q[:-len('_dispatched_log')]
-                status = 'dispatched'
-            else:
-                category_name = q[:-len('_failed_queue')]
-                status = 'failed'
-            length = history_counts.get((category_name, status), 0)
-        else:
-            try:
-                q_type = redisConnect.redis_master.type(q)
-                length = redisConnect.redis_master.llen(q) if q_type == 'list' else 0
-            except Exception:
-                length = 0
+        if q not in ALLOWED_QUEUES:
+            continue
+        try:
+            q_type = redisConnect.redis_master.type(q)
+            length = redisConnect.redis_master.llen(q) if q_type == 'list' else 0
+        except Exception:
+            length = 0
         queue_stats.append({"name": q, "length": length})
 
     # ── 2. Worker 狀態 ─────────────────────────────────────────
@@ -1391,78 +1193,92 @@ def dashboard_data():
     except Exception:
         pass
 
-    # ── 3. 今日任務統計（改用 SQL 對 task_history 直接算，取代原本掃描 Redis list）──
+    # ── 3. 今日任務統計（從 dispatched_log + failed_queue 計算）──
     categories = ["LotActions", "LineNotify", "prober"]
     today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
     total_dispatched_today = 0
     total_failed_today     = 0
 
-    try:
-        with pgConnect.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT status, count(*)
-                    FROM task_history
-                    WHERE category = ANY(%s)
-                      AND dispatch_time >= %s
-                    GROUP BY status
-                    """,
-                    (categories, today_start)
-                )
-                for status, cnt in cur.fetchall():
-                    if status == 'dispatched':
-                        total_dispatched_today = cnt
-                    elif status == 'failed':
-                        total_failed_today = cnt
-    except Exception:
-        pass
+    for cat in categories:
+        for suffix, is_fail in [("dispatched_log", False), ("failed_queue", True)]:
+            keys = [f"queue_history:{cat}_{suffix}", f"{cat}_{suffix}"]
+            raw_items = []
+            for k in keys:
+                try:
+                    if redisConnect.redis_master.exists(k):
+                        raw_items = redisConnect.redis_master.lrange(k, 0, -1)
+                        if raw_items:
+                            break
+                except Exception:
+                    pass
+            for raw in raw_items:
+                try:
+                    item = json.loads(raw)
+                    if item.get("task_id") == "__INIT__":
+                        continue
+                    ts = item.get("dispatch_time") or item.get("timestamp")
+                    if not ts:
+                        continue
+                    dt = safe_parse_datetime(str(ts))
+                    if not dt: continue
+                    dt = dt.replace(tzinfo=local_tz) if dt.tzinfo is None else dt.astimezone(local_tz)
+                    if dt < today_start:
+                        continue
+                    if is_fail:
+                        total_failed_today += 1
+                    else:
+                        total_dispatched_today += 1
+                except Exception:
+                    pass
 
     # ── 4. 趨勢圖資料（使用者選擇的 category，預設 LotActions）──
     category = request.args.get("category", "LotActions")
 
     all_labels = []
-    bucket_origin = cutoff.replace(
+    ptr = cutoff.replace(
         minute=(cutoff.minute // interval_min) * interval_min,
         second=0, microsecond=0
     )
-    ptr = bucket_origin
-    while ptr <= end_dt:
+    while ptr <= now_dt:
         all_labels.append(ptr.strftime('%H:%M'))
         ptr += timedelta(minutes=interval_min)
 
-    disp_bucket = defaultdict(int)
-    fail_bucket = defaultdict(int)
-    try:
-        with pgConnect.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT
-                        to_char(date_bin(%(interval)s, dispatch_time, %(origin)s) AT TIME ZONE 'Asia/Taipei', 'HH24:MI') AS bucket,
-                        status,
-                        count(*)
-                    FROM task_history
-                    WHERE category = %(category)s
-                      AND dispatch_time BETWEEN %(start)s AND %(end)s
-                    GROUP BY bucket, status
-                    """,
-                    {
-                        'interval': timedelta(minutes=interval_min),
-                        'origin': bucket_origin,
-                        'category': category,
-                        'start': cutoff,
-                        'end': end_dt,
-                    }
-                )
-                for bucket_label, status, cnt in cur.fetchall():
-                    if status == 'dispatched':
-                        disp_bucket[bucket_label] += cnt
-                    elif status == 'failed':
-                        fail_bucket[bucket_label] += cnt
-    except Exception:
-        pass
+    def _get_bucket(suffix):
+        keys = [f"queue_history:{category}_{suffix}", f"{category}_{suffix}"]
+        raw_items = []
+        for k in keys:
+            try:
+                if redisConnect.redis_master.exists(k):
+                    raw_items = redisConnect.redis_master.lrange(k, 0, -1)
+                    if raw_items:
+                        break
+            except Exception:
+                pass
+        bucket = defaultdict(int)
+        for raw in raw_items:
+            try:
+                item = json.loads(raw)
+                if item.get("task_id") == "__INIT__":
+                    continue
+                ts = item.get("dispatch_time") or item.get("timestamp")
+                if not ts:
+                    continue
+                dt = safe_parse_datetime(str(ts))
+                if not dt: continue
+                dt = dt.replace(tzinfo=local_tz) if dt.tzinfo is None else dt.astimezone(local_tz)
+
+                if dt < cutoff or dt > now_dt:
+                    continue
+                m = (dt.minute // interval_min) * interval_min
+                bk = dt.replace(minute=m, second=0, microsecond=0).strftime('%H:%M')
+                bucket[bk] += 1
+            except Exception:
+                pass
+        return bucket
+
+    disp_bucket = _get_bucket("dispatched_log")
+    fail_bucket = _get_bucket("failed_queue")
 
     chart_data = {
         "labels":            all_labels,
