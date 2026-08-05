@@ -56,7 +56,6 @@
     {% block head %}{% endblock %}
 </head>
 <body class="bg-gray-100 font-sans min-h-screen">
-
     <!-- ── 頂部導覽 ── -->
     <nav class="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between sticky top-0 z-50">
         <div class="flex items-center gap-6">
@@ -100,10 +99,6 @@
                    class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'contacts' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
                     <i class="fas fa-address-book mr-1"></i>聯絡人
                 </a>
-                <a href="{{ url_for('equipment_history') }}"
-                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'equipment_history' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
-                    <i class="fas fa-history mr-1"></i>設備異動紀錄
-                </a>
                 <a href="{{ url_for('register') }}"
                    class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'register' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
                     <i class="fas fa-users-cog mr-1"></i>帳號管理
@@ -118,7 +113,6 @@
             </a>
         </div>
     </nav>
-
     <!-- ── 主體 ── -->
     <main class="p-5 max-w-screen-xl mx-auto">
         <!-- Flash Messages -->
@@ -131,10 +125,8 @@
             {% endfor %}
           {% endif %}
         {% endwith %}
-
         {% block content %}{% endblock %}
     </main>
-
     {% block scripts %}{% endblock %}
 </body>
 </html>

@@ -102,6 +102,82 @@ def init_worker_status_history_schema():
 init_worker_status_history_schema()
 
 
+def init_contacts_history_schema():
+    """啟動時檢查 contacts_history 表與對應的 PostgreSQL trigger 是否存在，
+    沒有就自動建立，有的話直接沿用（不會動到既有資料）。做法比照
+    init_worker_status_history_schema() / init_admin_user()，不需要另外
+    手動執行 SQL 腳本。
+
+    change_type 值：created / updated / deleted
+    changed_by：從 set_config('app.current_user', ...) 取得，
+                需要在同一個 transaction 裡先呼叫
+                pgConnect.set_current_user(conn, username) 才會生效
+                （update_contacts() 已經加上這個呼叫）。
+    old_value / new_value：用 row_to_json(...)::text 轉成純文字存放。
+    """
+    try:
+        with pgConnect.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS contacts_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        contact_id INTEGER,
+                        eqpid TEXT,
+                        change_type TEXT NOT NULL,
+                        changed_by TEXT,
+                        old_value TEXT,
+                        new_value TEXT,
+                        changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_contacts_history_eqpid_time
+                    ON contacts_history (eqpid, changed_at)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_contacts_history_time
+                    ON contacts_history (changed_at)
+                """)
+
+                cur.execute("""
+                    CREATE OR REPLACE FUNCTION log_contacts_change()
+                    RETURNS TRIGGER AS $$
+                    DECLARE
+                        v_user TEXT;
+                    BEGIN
+                        v_user := current_setting('app.current_user', true);
+                        IF (TG_OP = 'INSERT') THEN
+                            INSERT INTO contacts_history (contact_id, eqpid, change_type, changed_by, old_value, new_value)
+                            VALUES (NEW.id, NEW.eqpid, 'created', v_user, NULL, row_to_json(NEW)::text);
+                            RETURN NEW;
+                        ELSIF (TG_OP = 'UPDATE') THEN
+                            INSERT INTO contacts_history (contact_id, eqpid, change_type, changed_by, old_value, new_value)
+                            VALUES (NEW.id, NEW.eqpid, 'updated', v_user, row_to_json(OLD)::text, row_to_json(NEW)::text);
+                            RETURN NEW;
+                        ELSIF (TG_OP = 'DELETE') THEN
+                            INSERT INTO contacts_history (contact_id, eqpid, change_type, changed_by, old_value, new_value)
+                            VALUES (OLD.id, OLD.eqpid, 'deleted', v_user, row_to_json(OLD)::text, NULL);
+                            RETURN OLD;
+                        END IF;
+                        RETURN NULL;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                """)
+                cur.execute("""
+                    DROP TRIGGER IF EXISTS trg_contacts_history ON contacts
+                """)
+                cur.execute("""
+                    CREATE TRIGGER trg_contacts_history
+                    AFTER INSERT OR UPDATE OR DELETE ON contacts
+                    FOR EACH ROW EXECUTE FUNCTION log_contacts_change()
+                """)
+        print("contacts_history 表與 trigger 已確認存在（不存在則已自動建立）。")
+    except Exception as e:
+        print(f"Error initializing contacts_history schema: {e}")
+
+init_contacts_history_schema()
+
+
 # ── Worker 狀態歷史背景同步 ──────────────────────────────────────
 # 跟 redisConnect.listen_for_failover 一樣，用背景 daemon thread 常駐執行，
 # 不需要另外開一個容器/服務。持續輪詢 Redis 的 worker_status Hash，
@@ -1137,6 +1213,29 @@ def equipments():
     filter_eqptype = request.args.get('eqptype', '').strip()
     filter_eqpid = request.args.get('eqpid', '').strip()
 
+    # ── 分頁參數（跟 Queue 內容查詢 /index 的邏輯一致）──────────────
+    # per_page 除了 10/25/50/100 之外，多支援 'all' 代表不分頁、一次顯示全部。
+    try:
+        page = int(request.args.get('page', 1))
+    except (ValueError, TypeError):
+        page = 1
+    if page < 1:
+        page = 1
+
+    per_page_raw = request.args.get('per_page', '10').strip()
+    if per_page_raw == 'all':
+        per_page = 'all'
+    else:
+        try:
+            per_page = int(per_page_raw)
+        except (ValueError, TypeError):
+            per_page = 10
+        if per_page not in [10, 25, 50, 100]:
+            per_page = 10
+
+    total_count = 0
+    total_pages = 1
+
     try:
         conditions = []
         params = []
@@ -1154,7 +1253,23 @@ def equipments():
 
         with pgConnect.get_conn() as conn:
             with pgConnect.dict_cursor(conn) as cur:
-                cur.execute(f"SELECT * FROM equipments {where_clause} ORDER BY eqpid", params)
+                # 先算符合篩選條件的總筆數，才能算出總頁數／驗證目前頁碼是否超出範圍
+                cur.execute(f"SELECT count(*) AS cnt FROM equipments {where_clause}", params)
+                total_count = cur.fetchone()['cnt']
+
+                if per_page == 'all':
+                    total_pages = 1
+                    page = 1
+                    cur.execute(f"SELECT * FROM equipments {where_clause} ORDER BY eqpid", params)
+                else:
+                    total_pages = (total_count + per_page - 1) // per_page if total_count else 1
+                    if page > total_pages:
+                        page = total_pages
+                    offset = (page - 1) * per_page
+                    cur.execute(
+                        f"SELECT * FROM equipments {where_clause} ORDER BY eqpid LIMIT %s OFFSET %s",
+                        params + [per_page, offset]
+                    )
                 rows = cur.fetchall()
 
         for row in rows:
@@ -1184,6 +1299,10 @@ def equipments():
         filter_floor=filter_floor,
         filter_eqptype=filter_eqptype,
         filter_eqpid=filter_eqpid,
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages,
+        total_count=total_count,
         active_page='equipments'
     )
 
@@ -1270,9 +1389,13 @@ def script_update():
 @login_required
 def update_contacts():
     edit_mode = request.form.get('edit_mode', '0')
+    current_user = session.get('username', '')
 
     if edit_mode == '1':
         with pgConnect.get_conn() as conn:
+            # 讓 contacts_history 的 trigger 記得是誰做的異動
+            pgConnect.set_current_user(conn, current_user)
+
             with conn.cursor() as cur:
                 cur.execute("SELECT id, eqpid, eqptype, action, linegroup, floor FROM contacts")
                 existing_map = {
@@ -1312,7 +1435,10 @@ def update_contacts():
                 new_linegroups = request.form.getlist('new_LINEGROUP[]')
                 new_floors = request.form.getlist('new_floor[]')
 
-                new_row_count = max(len(new_eqpids), len(new_eqptypes), len(new_actions), len(new_linegroups), len(new_floors), default=0)
+                new_row_count = max(
+                    [len(new_eqpids), len(new_eqptypes), len(new_actions), len(new_linegroups), len(new_floors)],
+                    default=0
+                )
                 for i in range(new_row_count):
                     eqpid = new_eqpids[i].strip() if i < len(new_eqpids) else ''
                     eqptype = new_eqptypes[i].strip() if i < len(new_eqptypes) else ''
@@ -1348,6 +1474,29 @@ def contacts():
     filter_eqptype = request.args.get('eqptype', '').strip()
     filter_eqpid = request.args.get('eqpid', '').strip()
 
+    # ── 分頁參數（跟 /equipments 的邏輯一致）──────────────────────
+    # per_page 除了 10/25/50/100 之外，多支援 'all' 代表不分頁、一次顯示全部。
+    try:
+        page = int(request.args.get('page', 1))
+    except (ValueError, TypeError):
+        page = 1
+    if page < 1:
+        page = 1
+
+    per_page_raw = request.args.get('per_page', '10').strip()
+    if per_page_raw == 'all':
+        per_page = 'all'
+    else:
+        try:
+            per_page = int(per_page_raw)
+        except (ValueError, TypeError):
+            per_page = 10
+        if per_page not in [10, 25, 50, 100]:
+            per_page = 10
+
+    total_count = 0
+    total_pages = 1
+
     try:
         conditions = []
         params = []
@@ -1365,7 +1514,22 @@ def contacts():
 
         with pgConnect.get_conn() as conn:
             with pgConnect.dict_cursor(conn) as cur:
-                cur.execute(f"SELECT * FROM contacts {where_clause} ORDER BY id", params)
+                cur.execute(f"SELECT count(*) AS cnt FROM contacts {where_clause}", params)
+                total_count = cur.fetchone()['cnt']
+
+                if per_page == 'all':
+                    total_pages = 1
+                    page = 1
+                    cur.execute(f"SELECT * FROM contacts {where_clause} ORDER BY id", params)
+                else:
+                    total_pages = (total_count + per_page - 1) // per_page if total_count else 1
+                    if page > total_pages:
+                        page = total_pages
+                    offset = (page - 1) * per_page
+                    cur.execute(
+                        f"SELECT * FROM contacts {where_clause} ORDER BY id LIMIT %s OFFSET %s",
+                        params + [per_page, offset]
+                    )
                 rows = cur.fetchall()
 
         for row in rows:
@@ -1394,7 +1558,61 @@ def contacts():
         filter_floor=filter_floor,
         filter_eqptype=filter_eqptype,
         filter_eqpid=filter_eqpid,
+        page=page,
+        per_page=per_page,
+        total_pages=total_pages,
+        total_count=total_count,
         active_page='contacts'
+    )
+
+
+def load_contact_history(eqpid=''):
+    """查詢聯絡人異動紀錄（contacts_history 表由 PostgreSQL trigger 自動寫入，
+    見 init_contacts_history_schema()）。eqpid 有值時只查該 EQPID 相關的紀錄，
+    沒有值時回傳最近 200 筆全部紀錄。"""
+    history = []
+    history_error = None
+    try:
+        with pgConnect.get_conn() as conn:
+            with pgConnect.dict_cursor(conn) as cur:
+                if eqpid:
+                    cur.execute(
+                        """
+                        SELECT * FROM contacts_history
+                         WHERE eqpid = %s
+                         ORDER BY changed_at DESC
+                         LIMIT 200
+                        """,
+                        (eqpid,)
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT * FROM contacts_history
+                         ORDER BY changed_at DESC
+                         LIMIT 200
+                        """
+                    )
+                history = cur.fetchall()
+        if not history:
+            history_error = "沒有找到異動紀錄。"
+    except Exception as e:
+        history_error = f"查詢失敗：{e}"
+    return history, history_error
+
+
+@app.route('/contact_history')
+@login_required
+def contact_history():
+    """查看聯絡人異動紀錄（獨立頁面，進入按鈕放在 /contacts 頁面裡）。"""
+    eqpid = request.args.get('eqpid', '').strip()
+    history, error = load_contact_history(eqpid)
+    return render_template(
+        'contact_history.html',
+        history=history,
+        eqpid=eqpid,
+        error=error,
+        active_page='contact_history'
     )
 
 def compute_worker_utilization(queue_name, cutoff, end_dt, interval_min, worker_filter=''):
