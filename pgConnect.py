@@ -32,7 +32,6 @@ def connect_to_pg(retry=10, delay=2, minconn=1, maxconn=10):
             )
             # 立即測試一次連線是否真的活著
             conn = _pool.getconn()
-            conn.close = conn.close  # no-op，避免誤用
             with conn.cursor() as cur:
                 cur.execute("SELECT 1;")
             _pool.putconn(conn)

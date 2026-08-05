@@ -82,6 +82,10 @@
                    class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'queue_history' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
                     <i class="fas fa-chart-line mr-1"></i>趨勢圖
                 </a>
+                <a href="{{ url_for('worker_utilization') }}"
+                   class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'worker_utilization' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
+                    <i class="fas fa-gauge-high mr-1"></i>稼動率
+                </a>
                 <a href="{{ url_for('api_trigger') }}"
                    class="text-xs px-3 py-1.5 rounded-md {% if active_page == 'api_trigger' %}active-nav{% else %}text-gray-600 hover:bg-gray-100{% endif %}">
                     <i class="fas fa-paper-plane mr-1"></i>API 測試
