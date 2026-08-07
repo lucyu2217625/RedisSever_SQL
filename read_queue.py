@@ -13,6 +13,16 @@ import time
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import requests
+import uuid
+import io
+
+# openpyxl 用來解析 Excel (.xlsx) 匯入檔案。
+# 如果環境還沒安裝這個套件（requirements.txt 需要加上 openpyxl 並重新 build image），
+# 匯入功能裡 Excel 上傳的部分會顯示清楚的錯誤訊息，但 JSON 上傳完全不受影響。
+try:
+    from openpyxl import load_workbook
+except ImportError:
+    load_workbook = None
 
 def safe_parse_datetime(dt_str):
     """ㄇ
@@ -1200,6 +1210,493 @@ def update_user_password():
     return redirect(url_for('register'))
 
 
+# ══════════════════════════════════════════════════════════════
+# 批次匯入功能（equipments / contacts 共用的核心邏輯）
+# ══════════════════════════════════════════════════════════════
+# 流程：
+#   1. 使用者上傳 JSON 或 Excel(.xlsx) 檔案
+#   2. 後端解析檔案，跟資料庫現有資料比對，產生「預覽清單」
+#      （標示每筆是 新增/更新/內容相同/檔案內重複/格式錯誤）
+#   3. 預覽清單暫存進 Redis（10 分鐘後自動過期），回傳一個 token
+#   4. 使用者在預覽畫面勾選要套用的項目，送出後端才會真正寫入 PostgreSQL
+#
+# 這樣設計是為了避免使用者上傳錯誤檔案就整批覆蓋資料庫，
+# 一定要先看過預覽、確認無誤才會真正動到資料。
+
+IMPORT_PREVIEW_TTL_SEC = 600  # 預覽資料在 Redis 裡保留 10 分鐘，超過要重新上傳
+
+
+def _read_uploaded_records(file_storage, outer_key_is_id):
+    """把上傳的 JSON 或 Excel 檔案，統一轉成 [{欄位: 值, ...}, ...] 的清單。
+
+    outer_key_is_id：
+        equipments 的 JSON 格式是 {"EQPID": {其餘欄位...}}，EQPID 是外層 key，
+        所以 outer_key_is_id=True 時，會把外層 key 補進每筆資料的 'EQPID' 欄位。
+        contacts 的 JSON 格式是 {"任意序號": {"EQPID": ..., 其餘欄位...}}，
+        EQPID 已經在內層欄位裡，外層 key 只是序號沒有意義，
+        所以 outer_key_is_id=False 時，會直接忽略外層 key。
+    """
+    filename = file_storage.filename or ''
+    ext = filename.rsplit('.', 1)[-1].lower() if '.' in filename else ''
+
+    if ext == 'json':
+        raw = file_storage.read()
+        try:
+            data = json.loads(raw.decode('utf-8-sig'))
+        except Exception as e:
+            raise ValueError(f"JSON 格式錯誤，請確認檔案內容是合法的 JSON：{e}")
+        if not isinstance(data, dict):
+            raise ValueError(
+                "JSON 內容必須是「物件」格式（key-value），"
+                '例如 {"EQPID1": {...}, "EQPID2": {...}}'
+            )
+        records = []
+        for key, val in data.items():
+            if not isinstance(val, dict):
+                continue
+            rec = dict(val)
+            if outer_key_is_id:
+                rec.setdefault('EQPID', key)
+            records.append(rec)
+        return records
+
+    elif ext == 'xlsx':
+        if load_workbook is None:
+            raise ValueError(
+                "伺服器尚未安裝 openpyxl 套件，無法解析 Excel 檔案。"
+                "請改用 JSON 格式上傳，或請系統管理員在 requirements.txt 加入 "
+                "openpyxl 並重新建置 Docker image。"
+            )
+        try:
+            wb = load_workbook(io.BytesIO(file_storage.read()), data_only=True)
+            ws = wb.active
+        except Exception as e:
+            raise ValueError(f"無法讀取 Excel 檔案：{e}")
+
+        rows_iter = ws.iter_rows(values_only=True)
+        headers = next(rows_iter, None)
+        if not headers:
+            raise ValueError("Excel 檔案是空的，或缺少標題列。")
+        headers = [str(h).strip() if h is not None else '' for h in headers]
+
+        records = []
+        for row in rows_iter:
+            if row is None or all(v is None or str(v).strip() == '' for v in row):
+                continue  # 跳過空白列
+            rec = {}
+            for h, v in zip(headers, row):
+                if not h:
+                    continue
+                rec[h] = '' if v is None else str(v).strip()
+            records.append(rec)
+        return records
+
+    elif ext == 'xls':
+        raise ValueError("目前不支援舊版 .xls 格式，請另存成 .xlsx 或改用 JSON 格式。")
+    else:
+        raise ValueError("不支援的檔案格式，請上傳 .json 或 .xlsx 檔案。")
+
+
+def _normalize_record_keys(rec, canonical_fields):
+    """把 Excel/JSON 讀進來的欄位名稱，不分大小寫比對成標準欄位名稱，
+    避免使用者輸入 eqpid / EqpId / EQPID 這種大小寫不一致的狀況而漏掉欄位。
+    不在 canonical_fields 清單裡的多餘欄位會被忽略。"""
+    lower_map = {c.lower(): c for c in canonical_fields}
+    normalized = {}
+    for k, v in rec.items():
+        canon = lower_map.get(str(k).strip().lower())
+        if canon:
+            normalized[canon] = v
+    return normalized
+
+
+def build_equipments_import_preview(records):
+    """比對上傳的 equipments 資料跟資料庫現況，產生預覽清單。
+    識別依據：EQPID（跟 equipments 表的主鍵一致）。"""
+    with pgConnect.get_conn() as conn:
+        with pgConnect.dict_cursor(conn) as cur:
+            cur.execute("SELECT * FROM equipments")
+            existing_rows = cur.fetchall()
+    existing_map = {row['eqpid']: row for row in existing_rows}
+
+    required = ['EQPTYPE', 'TESTERIP', 'PROBERIP', 'LINEGROUP', 'floor', 'Action']
+    canonical = ['EQPID'] + required
+
+    seen_in_file = set()
+    preview = []
+    counts = {'new': 0, 'update': 0, 'no_change': 0, 'error': 0, 'duplicate_in_file': 0}
+
+    for raw in records:
+        rec = _normalize_record_keys(raw, canonical)
+        eqpid = str(rec.get('EQPID', '')).strip()
+        item = {'eqpid': eqpid, 'data': rec}
+
+        if not eqpid:
+            item['status'] = 'error'
+            item['reason'] = '缺少 EQPID'
+            counts['error'] += 1
+            preview.append(item)
+            continue
+
+        if eqpid in seen_in_file:
+            item['status'] = 'duplicate_in_file'
+            item['reason'] = '檔案內重複的 EQPID（已忽略，僅套用第一筆出現的資料）'
+            counts['duplicate_in_file'] += 1
+            preview.append(item)
+            continue
+        seen_in_file.add(eqpid)
+
+        missing = [f for f in required if not str(rec.get(f, '')).strip()]
+        if missing:
+            item['status'] = 'error'
+            item['reason'] = f"缺少欄位：{', '.join(missing)}"
+            counts['error'] += 1
+            preview.append(item)
+            continue
+
+        existing = existing_map.get(eqpid)
+        if existing:
+            old = {
+                'EQPTYPE': existing['eqptype'] or '',
+                'TESTERIP': existing['testerip'] or '',
+                'PROBERIP': existing['proberip'] or '',
+                'LINEGROUP': existing['linegroup'] or '',
+                'floor': existing['floor'] or '',
+                'Action': existing['action'] or '',
+            }
+            new_vals = {f: str(rec.get(f, '')).strip() for f in required}
+            if new_vals == old:
+                item['status'] = 'no_change'
+                counts['no_change'] += 1
+            else:
+                item['status'] = 'update'
+                item['old'] = old
+                counts['update'] += 1
+        else:
+            item['status'] = 'new'
+            counts['new'] += 1
+
+        preview.append(item)
+
+    return preview, counts
+
+
+def build_contacts_import_preview(records):
+    """比對上傳的 contacts 資料跟資料庫現況，產生預覽清單。
+    contacts 沒有天然唯一鍵，識別依據改用 (EQPID, Action) 組合
+    ——同一設備、同一種觸發動作視為同一筆聯絡對應。"""
+    with pgConnect.get_conn() as conn:
+        with pgConnect.dict_cursor(conn) as cur:
+            cur.execute("SELECT * FROM contacts")
+            existing_rows = cur.fetchall()
+    existing_map = {}
+    for row in existing_rows:
+        key = ((row['eqpid'] or '').strip(), (row['action'] or '').strip())
+        existing_map[key] = row
+
+    required = ['EQPID', 'EQPTYPE', 'Action', 'LINEGROUP', 'floor']
+
+    seen_in_file = set()
+    preview = []
+    counts = {'new': 0, 'update': 0, 'no_change': 0, 'error': 0, 'duplicate_in_file': 0}
+
+    for raw in records:
+        rec = _normalize_record_keys(raw, required)
+        item = {'data': rec}
+
+        missing = [f for f in required if not str(rec.get(f, '')).strip()]
+        if missing:
+            item['status'] = 'error'
+            item['reason'] = f"缺少欄位：{', '.join(missing)}"
+            counts['error'] += 1
+            preview.append(item)
+            continue
+
+        key = (str(rec['EQPID']).strip(), str(rec['Action']).strip())
+        item['eqpid'] = key[0]
+
+        if key in seen_in_file:
+            item['status'] = 'duplicate_in_file'
+            item['reason'] = '檔案內重複（相同 EQPID + Action，已忽略，僅套用第一筆）'
+            counts['duplicate_in_file'] += 1
+            preview.append(item)
+            continue
+        seen_in_file.add(key)
+
+        existing = existing_map.get(key)
+        if existing:
+            old = {
+                'EQPID': existing['eqpid'] or '',
+                'EQPTYPE': existing['eqptype'] or '',
+                'Action': existing['action'] or '',
+                'LINEGROUP': existing['linegroup'] or '',
+                'floor': existing['floor'] or '',
+            }
+            new_vals = {f: str(rec.get(f, '')).strip() for f in required}
+            if new_vals == old:
+                item['status'] = 'no_change'
+                counts['no_change'] += 1
+            else:
+                item['status'] = 'update'
+                item['old'] = old
+                item['contact_id'] = existing['id']
+                counts['update'] += 1
+        else:
+            item['status'] = 'new'
+            counts['new'] += 1
+
+        preview.append(item)
+
+    return preview, counts
+
+
+def _store_import_preview(kind, preview):
+    """把預覽清單暫存進 Redis，設定 TTL 過期，回傳一個隨機 token 供之後confirm 用。"""
+    token = uuid.uuid4().hex
+    key = f"import_preview:{kind}:{token}"
+    redisConnect.redis_master.setex(key, IMPORT_PREVIEW_TTL_SEC, json.dumps(preview, ensure_ascii=False))
+    return token
+
+
+def _load_import_preview(kind, token):
+    key = f"import_preview:{kind}:{token}"
+    raw = redisConnect.redis_master.get(key)
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+def _delete_import_preview(kind, token):
+    key = f"import_preview:{kind}:{token}"
+    redisConnect.redis_master.delete(key)
+
+
+@app.route('/equipments/import', methods=['GET', 'POST'])
+@login_required
+@role_required('admin')
+def equipments_import():
+    """設備批次匯入：GET 顯示上傳表單，POST 解析檔案並顯示預覽畫面。"""
+    if request.method == 'GET':
+        return render_template('equipments_import.html', active_page='equipments')
+
+    file = request.files.get('import_file')
+    if not file or not file.filename:
+        flash('請選擇要上傳的檔案', 'error')
+        return redirect(url_for('equipments_import'))
+
+    try:
+        raw_records = _read_uploaded_records(file, outer_key_is_id=True)
+    except ValueError as e:
+        flash(str(e), 'error')
+        return redirect(url_for('equipments_import'))
+
+    if not raw_records:
+        flash('檔案內沒有可匯入的資料', 'error')
+        return redirect(url_for('equipments_import'))
+
+    preview, counts = build_equipments_import_preview(raw_records)
+    token = _store_import_preview('equipments', preview)
+
+    return render_template(
+        'equipments_import_preview.html',
+        preview=preview,
+        counts=counts,
+        token=token,
+        active_page='equipments'
+    )
+
+
+@app.route('/equipments/import/confirm', methods=['POST'])
+@login_required
+@role_required('admin')
+def equipments_import_confirm():
+    """使用者在預覽畫面勾選項目後，這裡才真正寫入 PostgreSQL。"""
+    token = request.form.get('token', '')
+    selected_indices = request.form.getlist('selected_indices[]')
+    current_user = session.get('username', '')
+
+    preview = _load_import_preview('equipments', token)
+    if preview is None:
+        flash('匯入逾時或資料已失效（預覽保留 10 分鐘），請重新上傳檔案。', 'error')
+        return redirect(url_for('equipments_import'))
+
+    created = updated = 0
+    try:
+        with pgConnect.get_conn() as conn:
+            # 讓 equipment_history 的 trigger 記得是誰做的匯入異動
+            pgConnect.set_current_user(conn, current_user)
+            with conn.cursor() as cur:
+                for idx_str in selected_indices:
+                    try:
+                        idx = int(idx_str)
+                    except ValueError:
+                        continue
+                    if idx < 0 or idx >= len(preview):
+                        continue
+                    item = preview[idx]
+                    if item['status'] not in ('new', 'update'):
+                        continue
+                    rec = item['data']
+                    eqpid = item['eqpid']
+
+                    if item['status'] == 'new':
+                        cur.execute(
+                            """
+                            INSERT INTO equipments (eqpid, eqptype, testerip, proberip, linegroup, floor, action)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (
+                                eqpid,
+                                rec.get('EQPTYPE', ''), rec.get('TESTERIP', ''), rec.get('PROBERIP', ''),
+                                rec.get('LINEGROUP', ''), rec.get('floor', ''), rec.get('Action', ''),
+                            )
+                        )
+                        created += 1
+                    else:
+                        cur.execute(
+                            """
+                            UPDATE equipments
+                               SET eqptype = %s, testerip = %s, proberip = %s,
+                                   linegroup = %s, floor = %s, action = %s,
+                                   updated_at = now()
+                             WHERE eqpid = %s
+                            """,
+                            (
+                                rec.get('EQPTYPE', ''), rec.get('TESTERIP', ''), rec.get('PROBERIP', ''),
+                                rec.get('LINEGROUP', ''), rec.get('floor', ''), rec.get('Action', ''), eqpid,
+                            )
+                        )
+                        updated += 1
+        _delete_import_preview('equipments', token)
+        flash(f'匯入完成：新增 {created} 筆、更新 {updated} 筆。', 'success')
+    except Exception as e:
+        flash(f'匯入失敗：{e}', 'error')
+
+    return redirect(url_for('equipments'))
+
+
+@app.route('/equipments/import/cancel', methods=['POST'])
+@login_required
+@role_required('admin')
+def equipments_import_cancel():
+    token = request.form.get('token', '')
+    _delete_import_preview('equipments', token)
+    flash('已取消匯入。', 'success')
+    return redirect(url_for('equipments'))
+
+
+@app.route('/contacts/import', methods=['GET', 'POST'])
+@login_required
+@role_required('admin')
+def contacts_import():
+    """聯絡人批次匯入：GET 顯示上傳表單，POST 解析檔案並顯示預覽畫面。"""
+    if request.method == 'GET':
+        return render_template('contacts_import.html', active_page='contacts')
+
+    file = request.files.get('import_file')
+    if not file or not file.filename:
+        flash('請選擇要上傳的檔案', 'error')
+        return redirect(url_for('contacts_import'))
+
+    try:
+        raw_records = _read_uploaded_records(file, outer_key_is_id=False)
+    except ValueError as e:
+        flash(str(e), 'error')
+        return redirect(url_for('contacts_import'))
+
+    if not raw_records:
+        flash('檔案內沒有可匯入的資料', 'error')
+        return redirect(url_for('contacts_import'))
+
+    preview, counts = build_contacts_import_preview(raw_records)
+    token = _store_import_preview('contacts', preview)
+
+    return render_template(
+        'contacts_import_preview.html',
+        preview=preview,
+        counts=counts,
+        token=token,
+        active_page='contacts'
+    )
+
+
+@app.route('/contacts/import/confirm', methods=['POST'])
+@login_required
+@role_required('admin')
+def contacts_import_confirm():
+    """使用者在預覽畫面勾選項目後，這裡才真正寫入 PostgreSQL。"""
+    token = request.form.get('token', '')
+    selected_indices = request.form.getlist('selected_indices[]')
+    current_user = session.get('username', '')
+
+    preview = _load_import_preview('contacts', token)
+    if preview is None:
+        flash('匯入逾時或資料已失效（預覽保留 10 分鐘），請重新上傳檔案。', 'error')
+        return redirect(url_for('contacts_import'))
+
+    created = updated = 0
+    try:
+        with pgConnect.get_conn() as conn:
+            # 讓 contacts_history 的 trigger 記得是誰做的匯入異動
+            pgConnect.set_current_user(conn, current_user)
+            with conn.cursor() as cur:
+                for idx_str in selected_indices:
+                    try:
+                        idx = int(idx_str)
+                    except ValueError:
+                        continue
+                    if idx < 0 or idx >= len(preview):
+                        continue
+                    item = preview[idx]
+                    if item['status'] not in ('new', 'update'):
+                        continue
+                    rec = item['data']
+
+                    if item['status'] == 'new':
+                        cur.execute(
+                            """
+                            INSERT INTO contacts (eqpid, eqptype, action, linegroup, floor)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (
+                                rec.get('EQPID', ''), rec.get('EQPTYPE', ''), rec.get('Action', ''),
+                                rec.get('LINEGROUP', ''), rec.get('floor', ''),
+                            )
+                        )
+                        created += 1
+                    else:
+                        contact_id = item.get('contact_id')
+                        cur.execute(
+                            """
+                            UPDATE contacts
+                               SET eqpid = %s, eqptype = %s, action = %s,
+                                   linegroup = %s, floor = %s
+                             WHERE id = %s
+                            """,
+                            (
+                                rec.get('EQPID', ''), rec.get('EQPTYPE', ''), rec.get('Action', ''),
+                                rec.get('LINEGROUP', ''), rec.get('floor', ''), contact_id,
+                            )
+                        )
+                        updated += 1
+        _delete_import_preview('contacts', token)
+        flash(f'匯入完成：新增 {created} 筆、更新 {updated} 筆。', 'success')
+    except Exception as e:
+        flash(f'匯入失敗：{e}', 'error')
+
+    return redirect(url_for('contacts'))
+
+
+@app.route('/contacts/import/cancel', methods=['POST'])
+@login_required
+@role_required('admin')
+def contacts_import_cancel():
+    token = request.form.get('token', '')
+    _delete_import_preview('contacts', token)
+    flash('已取消匯入。', 'success')
+    return redirect(url_for('contacts'))
+
+
 @app.route('/equipments', methods=['GET', 'POST'])
 def equipments():
     error = None
@@ -1475,7 +1972,6 @@ def contacts():
     filter_eqpid = request.args.get('eqpid', '').strip()
 
     # ── 分頁參數（跟 /equipments 的邏輯一致）──────────────────────
-    # per_page 除了 10/25/50/100 之外，多支援 'all' 代表不分頁、一次顯示全部。
     try:
         page = int(request.args.get('page', 1))
     except (ValueError, TypeError):
