@@ -1,14 +1,14 @@
 {% extends "layout.html" %}
-{% block title %}設備異動紀錄{% endblock %}
+{% block title %}聯絡人異動紀錄{% endblock %}
 {% block content %}
 <div class="card p-5">
     <div class="flex items-center justify-between mb-4">
         <h1 class="text-lg font-semibold text-gray-800">
-            <i class="fas fa-history mr-2 text-blue-600"></i>設備異動紀錄
-            <span class="text-xs text-gray-400 font-normal ml-2">（由 PostgreSQL trigger 自動記錄，equipments 表任何新增/修改/刪除都會留下痕跡）</span>
+            <i class="fas fa-history mr-2 text-blue-600"></i>聯絡人異動紀錄
+            <span class="text-xs text-gray-400 font-normal ml-2">（由 PostgreSQL trigger 自動記錄，contacts 表任何新增/修改/刪除都會留下痕跡）</span>
         </h1>
-        <a href="{{ url_for('equipments') }}" class="btn-secondary btn-sm">
-            <i class="fas fa-arrow-left mr-1"></i> 返回設備配置管理
+        <a href="{{ url_for('contacts') }}" class="btn-secondary btn-sm">
+            <i class="fas fa-arrow-left mr-1"></i> 返回聯絡人管理
         </a>
     </div>
     <form method="GET" class="flex items-center gap-2 mb-4">
