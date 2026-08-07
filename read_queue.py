@@ -54,6 +54,137 @@ threading.Thread(target=redisConnect.listen_for_failover, daemon=True).start()
 
 pgConnect.connect_to_pg()
 
+
+def init_core_schema():
+    """啟動時檢查系統核心資料表是否存在，沒有就自動建立，有的話直接沿用
+    （不會動到既有資料）。統一做法：所有建表一律用 CREATE TABLE IF NOT EXISTS，
+    不再依賴 schema.sql 只在 PostgreSQL volume「第一次啟動」時才生效的機制
+    ——這樣不管換到哪個環境部署、volume 是不是全新的，這些表都保證存在。
+
+    涵蓋的表：
+      users             帳號登入用（username, password_hash, role）
+      equipments        機台對照表，eqpid 為主鍵
+      contacts          聯絡人對照表，id 為 SERIAL 主鍵
+      equipment_history 設備異動紀錄，由 trigger 自動寫入
+                        （created/updated/deleted，changed_by 靠
+                        set_config('app.current_user', ...) 取得）
+      task_history      dispatched_log/failed_queue 的長期歷史存放處，
+                        由 history_sync 服務持續從 Redis 搬過來寫入；
+                        payload 用 JSONB，因為程式碼裡有用
+                        payload->>'EQPID' 這種 JSONB 運算子查詢
+    """
+    try:
+        with pgConnect.get_conn() as conn:
+            with conn.cursor() as cur:
+                # ── users ──────────────────────────────────────
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        username TEXT PRIMARY KEY,
+                        password_hash TEXT NOT NULL,
+                        role TEXT NOT NULL DEFAULT 'viewer'
+                    )
+                """)
+
+                # ── equipments ─────────────────────────────────
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS equipments (
+                        eqpid TEXT PRIMARY KEY,
+                        eqptype TEXT,
+                        testerip TEXT,
+                        proberip TEXT,
+                        linegroup TEXT,
+                        floor TEXT,
+                        action TEXT,
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                """)
+
+                # ── contacts ───────────────────────────────────
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS contacts (
+                        id SERIAL PRIMARY KEY,
+                        eqpid TEXT,
+                        eqptype TEXT,
+                        action TEXT,
+                        linegroup TEXT,
+                        floor TEXT
+                    )
+                """)
+
+                # ── equipment_history（trigger 記錄 equipments 的異動）──
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS equipment_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        eqpid TEXT,
+                        change_type TEXT NOT NULL,
+                        changed_by TEXT,
+                        old_value TEXT,
+                        new_value TEXT,
+                        changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_equipment_history_eqpid_time
+                    ON equipment_history (eqpid, changed_at)
+                """)
+                cur.execute("""
+                    CREATE OR REPLACE FUNCTION log_equipment_change()
+                    RETURNS TRIGGER AS $$
+                    DECLARE
+                        v_user TEXT;
+                    BEGIN
+                        v_user := current_setting('app.current_user', true);
+                        IF (TG_OP = 'INSERT') THEN
+                            INSERT INTO equipment_history (eqpid, change_type, changed_by, old_value, new_value)
+                            VALUES (NEW.eqpid, 'created', v_user, NULL, row_to_json(NEW)::text);
+                            RETURN NEW;
+                        ELSIF (TG_OP = 'UPDATE') THEN
+                            INSERT INTO equipment_history (eqpid, change_type, changed_by, old_value, new_value)
+                            VALUES (NEW.eqpid, 'updated', v_user, row_to_json(OLD)::text, row_to_json(NEW)::text);
+                            RETURN NEW;
+                        ELSIF (TG_OP = 'DELETE') THEN
+                            INSERT INTO equipment_history (eqpid, change_type, changed_by, old_value, new_value)
+                            VALUES (OLD.eqpid, 'deleted', v_user, row_to_json(OLD)::text, NULL);
+                            RETURN OLD;
+                        END IF;
+                        RETURN NULL;
+                    END;
+                    $$ LANGUAGE plpgsql;
+                """)
+                cur.execute("DROP TRIGGER IF EXISTS trg_equipment_history ON equipments")
+                cur.execute("""
+                    CREATE TRIGGER trg_equipment_history
+                    AFTER INSERT OR UPDATE OR DELETE ON equipments
+                    FOR EACH ROW EXECUTE FUNCTION log_equipment_change()
+                """)
+
+                # ── task_history（history_sync 服務持續寫入）──────
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS task_history (
+                        id BIGSERIAL PRIMARY KEY,
+                        category TEXT NOT NULL,
+                        task_id TEXT,
+                        status TEXT NOT NULL,
+                        rpa_worker TEXT,
+                        dispatch_time TIMESTAMPTZ,
+                        payload JSONB
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_task_history_category_status_time
+                    ON task_history (category, status, dispatch_time DESC)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_task_history_payload_gin
+                    ON task_history USING GIN (payload)
+                """)
+        print("核心資料表（users/equipments/contacts/equipment_history/task_history）已確認存在（不存在則已自動建立）。")
+    except Exception as e:
+        print(f"Error initializing core schema: {e}")
+
+init_core_schema()
+
+
 def init_admin_user():
     try:
         with pgConnect.get_conn() as conn:

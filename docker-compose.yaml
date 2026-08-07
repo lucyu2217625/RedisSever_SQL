@@ -126,8 +126,11 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-please-change-me}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # 容器第一次啟動、資料目錄是空的時候，會自動執行 /docker-entrypoint-initdb.d/ 下的 .sql
-      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+      # 不再掛載 schema.sql：所有核心資料表（users/equipments/contacts/
+      # equipment_history/task_history/worker_status_history/contacts_history）
+      # 已改成 read_queue.py 啟動時用 CREATE TABLE IF NOT EXISTS 自動檢查建立，
+      # 詳見 init_core_schema() / init_worker_status_history_schema() /
+      # init_contacts_history_schema()，不再依賴這個只在 volume 全新時才生效的機制。
     networks:
       redisnet:
         ipv4_address: 172.18.0.4
