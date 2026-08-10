@@ -2468,6 +2468,79 @@ def worker_utilization():
     )
 
 
+def compute_task_history_chart(category, cutoff, end_dt, interval_min, worker_filter='',
+                                py_label_format='%m-%d %H:%M', sql_label_format='MM-DD HH24:MI'):
+    """
+    查詢 PostgreSQL task_history 表，算出指定 category 在 [cutoff, end_dt]
+    區間內、每個時間桶的 dispatched/failed 筆數，回傳 chart_data 格式。
+
+    這是從 /queue_history 抽出來的共用邏輯，讓 dashboard_data() 的趨勢圖
+    也能呼叫同一套查詢，確保兩個頁面看到的趨勢圖數字完全一致，
+    不再各自維護一份、容易對不起來。
+
+    用 date_bin() 直接在資料庫端做時間分桶聚合，不需要把整個 Redis list
+    撈進 Python 手動算——這是目前系統的標準做法（跟 /queue_history 一致）。
+
+    py_label_format / sql_label_format：
+        兩邊頁面原本的 X 軸標籤格式不一樣——/queue_history 顯示「月-日 時:分」
+        （因為可以查好幾天的區間），/dashboard 只顯示「時:分」（因為固定只看
+        最近 6 小時，不需要日期）。這兩個參數必須保持對應（同樣的日期/時間
+        格式，只是 Python strftime 跟 PostgreSQL to_char 的語法不同），
+        才能讓 Python 端產生的 all_labels 跟 SQL 查出來的 bucket 字串對得上。
+    """
+    all_labels = []
+    bucket_origin = cutoff.replace(minute=(cutoff.minute // interval_min) * interval_min, second=0, microsecond=0)
+    ptr = bucket_origin
+    while ptr <= end_dt:
+        all_labels.append(ptr.strftime(py_label_format))
+        ptr += timedelta(minutes=interval_min)
+
+    sql = f"""
+        SELECT
+            to_char(
+                date_bin(%(interval)s, dispatch_time, %(origin)s) AT TIME ZONE 'Asia/Taipei',
+                '{sql_label_format}'
+            ) AS bucket,
+            status,
+            count(*) AS cnt
+        FROM task_history
+        WHERE category = %(category)s
+          AND dispatch_time BETWEEN %(start)s AND %(end)s
+          AND (%(worker)s = '' OR rpa_worker = %(worker)s)
+        GROUP BY bucket, status
+    """
+    params = {
+        'interval': timedelta(minutes=interval_min),
+        'origin': bucket_origin,
+        'category': category,
+        'start': cutoff,
+        'end': end_dt,
+        'worker': worker_filter,
+    }
+
+    disp_bucket = defaultdict(int)
+    fail_bucket = defaultdict(int)
+    total_dispatched = 0
+    total_failed = 0
+    with pgConnect.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            for bucket_label, status, cnt in cur.fetchall():
+                if status == 'dispatched':
+                    disp_bucket[bucket_label] += cnt
+                    total_dispatched += cnt
+                elif status == 'failed':
+                    fail_bucket[bucket_label] += cnt
+                    total_failed += cnt
+
+    chart_data = {
+        'labels': all_labels,
+        'counts_dispatched': [disp_bucket.get(lbl, 0) for lbl in all_labels],
+        'counts_failed': [fail_bucket.get(lbl, 0) for lbl in all_labels],
+    }
+    return chart_data, total_dispatched, total_failed
+
+
 @app.route('/queue_history')
 @login_required
 def queue_history():
@@ -2536,58 +2609,9 @@ def queue_history():
 
     if category:
         try:
-            # 定義標籤軸（維持跟原本一樣的顯示格式，方便前端不用改）
-            all_labels = []
-            bucket_origin = cutoff.replace(minute=(cutoff.minute // interval_min) * interval_min, second=0, microsecond=0)
-            ptr = bucket_origin
-            while ptr <= end_dt:
-                all_labels.append(ptr.strftime('%m-%d %H:%M'))
-                ptr += timedelta(minutes=interval_min)
-
-            # 用一句 SQL 直接做時間分桶聚合，取代原本把整個 Redis list 撈進 Python 再手動算的寫法。
-            # date_bin 把每一筆 dispatch_time 對齊到 interval_min 分鐘的桶子，直接在資料庫端 GROUP BY。
-            sql = """
-                SELECT
-                    to_char(
-                        date_bin(%(interval)s, dispatch_time, %(origin)s) AT TIME ZONE 'Asia/Taipei',
-                        'MM-DD HH24:MI'
-                    ) AS bucket,
-                    status,
-                    count(*) AS cnt
-                FROM task_history
-                WHERE category = %(category)s
-                  AND dispatch_time BETWEEN %(start)s AND %(end)s
-                  AND (%(worker)s = '' OR rpa_worker = %(worker)s)
-                GROUP BY bucket, status
-            """
-            params = {
-                'interval': timedelta(minutes=interval_min),
-                'origin': bucket_origin,
-                'category': category,
-                'start': cutoff,
-                'end': end_dt,
-                'worker': worker_name_filter,
-            }
-
-            disp_bucket = defaultdict(int)
-            fail_bucket = defaultdict(int)
-            with pgConnect.get_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(sql, params)
-                    for bucket_label, status, cnt in cur.fetchall():
-                        if status == 'dispatched':
-                            disp_bucket[bucket_label] += cnt
-                            total_dispatched += cnt
-                        elif status == 'failed':
-                            fail_bucket[bucket_label] += cnt
-                            total_failed += cnt
-
-            chart_data = {
-                'labels': all_labels,
-                'counts_dispatched': [disp_bucket.get(lbl, 0) for lbl in all_labels],
-                'counts_failed': [fail_bucket.get(lbl, 0) for lbl in all_labels]
-            }
-
+            chart_data, total_dispatched, total_failed = compute_task_history_chart(
+                category, cutoff, end_dt, interval_min, worker_name_filter
+            )
         except Exception as e:
             error = f"查詢失敗：{str(e)}"
 
@@ -2787,58 +2811,30 @@ def dashboard_data():
                     pass
 
     # ── 4. 趨勢圖資料（使用者選擇的 category，預設 LotActions）──
+    # 改成跟 /queue_history 一樣直接查 PostgreSQL task_history 表，不再讀 Redis。
+    # 原因：history_sync 服務會持續把 Redis 的 dispatched_log/failed_queue
+    # 搬到 task_history 並清空來源 list，所以讀 Redis 只能看到「還沒被搬走
+    # 的殘留資料」，數字會嚴重低估。查 task_history 才是真正累計、準確的數字，
+    # 也才能跟 /queue_history 頁面的數字互相對得起來。
     category = request.args.get("category", "LotActions")
 
-    all_labels = []
-    ptr = cutoff.replace(
-        minute=(cutoff.minute // interval_min) * interval_min,
-        second=0, microsecond=0
-    )
-    while ptr <= now_dt:
-        all_labels.append(ptr.strftime('%H:%M'))
-        ptr += timedelta(minutes=interval_min)
-
-    def _get_bucket(suffix):
-        keys = [f"queue_history:{category}_{suffix}", f"{category}_{suffix}"]
-        raw_items = []
-        for k in keys:
-            try:
-                if redisConnect.redis_master.exists(k):
-                    raw_items = redisConnect.redis_master.lrange(k, 0, -1)
-                    if raw_items:
-                        break
-            except Exception:
-                pass
-        bucket = defaultdict(int)
-        for raw in raw_items:
-            try:
-                item = json.loads(raw)
-                if item.get("task_id") == "__INIT__":
-                    continue
-                ts = item.get("dispatch_time") or item.get("timestamp")
-                if not ts:
-                    continue
-                dt = safe_parse_datetime(str(ts))
-                if not dt: continue
-                dt = dt.replace(tzinfo=local_tz) if dt.tzinfo is None else dt.astimezone(local_tz)
-
-                if dt < cutoff or dt > now_dt:
-                    continue
-                m = (dt.minute // interval_min) * interval_min
-                bk = dt.replace(minute=m, second=0, microsecond=0).strftime('%H:%M')
-                bucket[bk] += 1
-            except Exception:
-                pass
-        return bucket
-
-    disp_bucket = _get_bucket("dispatched_log")
-    fail_bucket = _get_bucket("failed_queue")
-
-    chart_data = {
-        "labels":            all_labels,
-        "counts_dispatched": [disp_bucket.get(l, 0) for l in all_labels],
-        "counts_failed":     [fail_bucket.get(l, 0) for l in all_labels],
-    }
+    try:
+        chart_data, _, _ = compute_task_history_chart(
+            category, cutoff, now_dt, interval_min,
+            py_label_format='%H:%M', sql_label_format='HH24:MI'
+        )
+    except Exception:
+        # 查詢失敗時維持原本的空圖表格式，不讓整個 dashboard_data API 掛掉
+        all_labels = []
+        ptr = cutoff.replace(minute=(cutoff.minute // interval_min) * interval_min, second=0, microsecond=0)
+        while ptr <= now_dt:
+            all_labels.append(ptr.strftime('%H:%M'))
+            ptr += timedelta(minutes=interval_min)
+        chart_data = {
+            "labels": all_labels,
+            "counts_dispatched": [0] * len(all_labels),
+            "counts_failed": [0] * len(all_labels),
+        }
 
     return jsonify({
         "queue_stats":             queue_stats,
