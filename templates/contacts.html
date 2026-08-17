@@ -1,7 +1,5 @@
 {% extends "layout.html" %}
-
 {% block title %}聯絡人管理 - Redis 佇列管理系統{% endblock %}
-
 {% block content %}
 <div class="flex items-center justify-between mb-6">
     <h1 class="text-lg font-semibold text-gray-800">通知聯絡人管理</h1>
@@ -25,7 +23,6 @@
         {% endif %}
     </div>
 </div>
-
 <!-- 篩選卡片（篩選條件與每頁顯示筆數放在同一個表單，一起送出）-->
 <div class="card p-4 mb-6">
     <form method="GET" action="{{ url_for('contacts') }}" class="flex flex-wrap items-end gap-4">
@@ -56,14 +53,12 @@
         <a href="{{ url_for('contacts') }}" class="btn-secondary">清除</a>
     </form>
 </div>
-
 {% if error %}
 <div class="bg-amber-50 border border-amber-200 text-amber-800 p-4 rounded-xl text-sm mb-6 flex items-center gap-3">
     <i class="fas fa-info-circle text-amber-500"></i>
     {{ error }}
 </div>
 {% endif %}
-
 <!-- 列表卡片 -->
 <form id="contact-form" method="POST" action="{{ url_for('update_contacts') }}">
     <input type="hidden" name="edit_mode" value="1">
@@ -115,13 +110,11 @@
                 </tbody>
             </table>
         </div>
-
         <div class="p-4 bg-gray-50 border-t border-gray-200 edit-mode hidden">
             <button type="button" onclick="addNewRow()" class="btn-secondary btn-sm">
                 <i class="fas fa-plus-circle mr-1"></i> 新增聯絡對應
             </button>
         </div>
-
         <!-- 分頁（per_page='all' 時不分頁，不顯示這個區塊） -->
         {% if per_page != 'all' and total_pages > 1 %}
         <div class="px-4 py-3 bg-white border-t border-gray-200 flex items-center justify-between">
@@ -131,7 +124,12 @@
                 </div>
                 <div class="flex items-center gap-2">
                     <label class="text-xs text-gray-500">跳至第</label>
-                    <select onchange="window.location.href='{{ url_for('contacts', floor=filter_floor, eqptype=filter_eqptype, eqpid=filter_eqpid, per_page=per_page) }}&page=' + this.value"
+                    <!-- 改用 data-base-url 屬性存放不含 page 參數的基底網址，
+                         避免直接把 Jinja url_for(...) 巢狀單引號塞進 onchange="..." 字串裡，
+                         那樣寫法會跟 JS 的單引號字串邊界互相衝突（VS Code 會誤報語法錯誤，
+                         雖然伺服器渲染後通常仍可運作，但這種寫法很容易在其他地方出錯）。 -->
+                    <select data-base-url="{{ url_for('contacts', floor=filter_floor, eqptype=filter_eqptype, eqpid=filter_eqpid, per_page=per_page) }}"
+                            onchange="window.location.href = this.dataset.baseUrl + '&page=' + this.value"
                             class="text-xs border border-gray-300 rounded px-2 py-1 outline-none focus:ring-1 focus:ring-blue-400 bg-white cursor-pointer">
                         {% for p in range(1, total_pages + 1) %}
                         <option value="{{ p }}" {% if p == page %}selected{% endif %}>{{ p }}</option>
@@ -146,7 +144,6 @@
                     <i class="fas fa-chevron-left"></i> 上一頁
                 </a>
                 {% endif %}
-
                 {% if page < total_pages %}
                 <a href="{{ url_for('contacts', floor=filter_floor, eqptype=filter_eqptype, eqpid=filter_eqpid, page=page+1, per_page=per_page) }}" class="btn-secondary btn-sm">
                     下一頁 <i class="fas fa-chevron-right"></i>
@@ -158,12 +155,10 @@
     </div>
 </form>
 {% endblock %}
-
 {% block scripts %}
 <script>
     function toggleEditMode() {
         const isEditing = !document.getElementById('save-btn').classList.contains('hidden');
-        
         if (isEditing) {
             document.querySelectorAll('.new-contact-row').forEach(row => row.remove());
             document.querySelectorAll('.edit-mode').forEach(el => el.classList.add('hidden'));
@@ -181,13 +176,11 @@
             document.getElementById('edit-btn').className = 'btn-ghost';
         }
     }
-
     function saveChanges() {
         if (confirm('確定要儲存所有變更嗎？')) {
             document.getElementById('contact-form').submit();
         }
     }
-
     function addNewRow() {
         const tbody = document.getElementById('contact-tbody');
         const tr = document.createElement('tr');
@@ -197,7 +190,7 @@
             <td class="p-3"><input type="text" name="new_floor[]" placeholder="樓層" class="text-sm border border-blue-300 rounded px-2 py-1 w-full"></td>
             <td class="p-3"><input type="text" name="new_EQPTYPE[]" placeholder="類型" class="text-sm border border-blue-300 rounded px-2 py-1 w-full"></td>
             <td class="p-3"><input type="text" name="new_ACTION[]" placeholder="Action" class="text-sm border border-blue-300 rounded px-2 py-1 w-full"></td>
-            <td class="p-3"><input type="text" name="new_LINEGROUP[]" placeholder="Token" class="text-sm border border-blue-300 rounded px-2 py-1 w-full font-mono"></td>
+            <td class="p-3"><input type="text" name="new_LINEGROUP[]" placeholder="LineGroup" class="text-sm border border-blue-300 rounded px-2 py-1 w-full font-mono"></td>
             <td class="p-3"></td>
         `;
         tbody.appendChild(tr);

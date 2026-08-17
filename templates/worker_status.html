@@ -187,6 +187,14 @@
     let editingMode = false;
     let updating = false;
 
+    // A2：把外部（RPA 端寫入）字串塞進 innerHTML 前一律跳脫，
+    // 避免 worker 名稱含 < > " & 造成破版或標記注入。
+    function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+
     function normalizeStatus(status) {
 
         return (status || 'unknown')
@@ -280,45 +288,49 @@
 
         grid.innerHTML = workers.map(({ queueName, name, status }) => {
 
+            const qEsc = escapeHtml(queueName);
+            const nEsc = escapeHtml(name);
+            const sEsc = escapeHtml(status);
+
             const statusNode = editingMode
                 ? `
                     <button
                         type="button"
                         class="${statusButtonClass(status)}"
-                        data-queue="${queueName}"
-                        data-worker="${name}"
-                        data-status="${status}"
+                        data-queue="${qEsc}"
+                        data-worker="${nEsc}"
+                        data-status="${sEsc}"
                         onclick="cycleWorkerStatus(this)"
                     >
-                        ${status}
+                        ${sEsc}
                     </button>
                 `
                 : `
                     <span class="text-xs font-medium px-2 py-0.5 rounded-full ${statusClass(status)}">
-                        ${status}
+                        ${sEsc}
                     </span>
                 `;
 
             return `
                 <div
                     class="worker-cell rounded-lg border border-gray-200 p-3 bg-white"
-                    data-queue="${queueName}"
-                    data-worker="${name}"
-                    data-status="${status}"
+                    data-queue="${qEsc}"
+                    data-worker="${nEsc}"
+                    data-status="${sEsc}"
                 >
 
                     <div
                         class="text-xs text-gray-500 truncate mb-2"
-                        title="${name}"
+                        title="${nEsc}"
                     >
-                        ${name}
+                        ${nEsc}
                     </div>
 
                     <div class="flex items-center justify-between">
 
                         ${statusNode}
 
-                        <span class="w-2.5 h-2.5 rounded-full ${statusDotClass(status)}"></span>
+                        <span data-status-dot class="w-2.5 h-2.5 rounded-full ${statusDotClass(status)}"></span>
 
                     </div>
 
@@ -373,9 +385,10 @@
 
         editingMode = true;
 
-        document.getElementById('edit-btn').classList.add('hidden');
-        document.getElementById('save-btn').classList.remove('hidden');
-        document.getElementById('cancel-btn').classList.remove('hidden');
+        // A1：edit-btn 目前被 Jinja 註解停用，可能不存在，用 ?. 保護避免 null crash。
+        document.getElementById('edit-btn')?.classList.add('hidden');
+        document.getElementById('save-btn')?.classList.remove('hidden');
+        document.getElementById('cancel-btn')?.classList.remove('hidden');
 
         renderWorkers();
     }
@@ -384,9 +397,10 @@
 
         editingMode = false;
 
-        document.getElementById('edit-btn').classList.remove('hidden');
-        document.getElementById('save-btn').classList.add('hidden');
-        document.getElementById('cancel-btn').classList.add('hidden');
+        // A1：同上，saveChanges() 成功後會呼叫這裡，edit-btn 為 null 會整支 crash。
+        document.getElementById('edit-btn')?.classList.remove('hidden');
+        document.getElementById('save-btn')?.classList.add('hidden');
+        document.getElementById('cancel-btn')?.classList.add('hidden');
 
         renderWorkers();
     }
@@ -417,7 +431,8 @@
 
             root.setAttribute('data-status', next);
 
-            const dot = root.querySelector('.w-2\\.5');
+            // A5：改用穩定的 data-status-dot 掛勾，不再依賴跳脫 Tailwind 的 .w-2.5 class。
+            const dot = root.querySelector('[data-status-dot]');
 
             if (dot) {
 
@@ -494,7 +509,9 @@
 
         updateData();
 
-        setInterval(updateData, 5000);
+        // B3：分頁在背景時暫停輪詢，回前景立即更新一次。
+        setInterval(() => { if (!document.hidden) updateData(); }, 5000);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) updateData(); });
     });
 
 </script>

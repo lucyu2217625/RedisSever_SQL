@@ -104,6 +104,25 @@
     </div>
 </div>
 
+<!--
+  將後端要交給前端 JS 的初始圖表資料，改用 data 屬性存放，
+  不要直接把 Jinja2 的條件輸出語法塞進 script 區塊裡當成
+  JavaScript 陳述式的一部分。
+
+  原因：Jinja2 的條件輸出是 Python 風格的三元運算寫法，
+  跟 JavaScript 的條件運算子語法完全不同；VS Code 的 JS 語法
+  檢查器看到原始檔案（尚未經過樣板引擎渲染）時，會把這段誤判成
+  損壞的 JavaScript，報出一長串語法錯誤。實際上樣板渲染後這段會
+  被替換成合法的 JSON 字面值，執行時不會有問題，但這種寫法很容易
+  在其他地方造成困惑，也讓編輯器的語法檢查形同虛設。
+
+  改成把資料放進 data-chart-json 這個屬性裡，script 區塊完全是
+  純淨的 JavaScript，JS 語法檢查器可以正常運作，也更容易維護。
+-->
+<div id="chart-data-holder"
+     data-chart-json='{{ chart_data | tojson | safe if chart_data else "null" }}'
+     class="hidden"></div>
+
 <!-- 圖表卡片 -->
 <div class="card p-6">
     <div style="position: relative; height:400px; width:100%">
@@ -192,6 +211,15 @@
         });
     }
 
+    // A4：輪詢更新時不整個 destroy()+new，改成只換資料再 update('none')，避免閃爍與多餘開銷。
+    function updateChart(data) {
+        if (!myChart) { initChart(data); return; }
+        myChart.data.labels = data.labels;
+        myChart.data.datasets[0].data = data.counts_dispatched;
+        myChart.data.datasets[1].data = data.counts_failed;
+        myChart.update('none');
+    }
+
     async function updateData() {
         const params = new URLSearchParams(window.location.search);
         try {
@@ -200,7 +228,7 @@
             });
             const data = await response.json();
             if (data.chart_data) {
-                initChart(data.chart_data);
+                updateChart(data.chart_data);
                 document.getElementById('stat-dispatched').textContent = data.total_dispatched;
                 document.getElementById('stat-failed').textContent = data.total_failed;
             }
@@ -210,15 +238,17 @@
     }
 
     document.addEventListener('DOMContentLoaded', () => {
-        const chartData = {{ chart_data | tojson | safe if chart_data else 'null' }};
+        const rawChartJson = document.getElementById('chart-data-holder').dataset.chartJson;
+        const chartData = rawChartJson ? JSON.parse(rawChartJson) : null;
         if (chartData) {
             initChart(chartData);
         }
-        
+
         // 如果是 "最近時段" 模式，開啟自動更新
         const mode = document.getElementById('time_mode').value;
         if (mode === 'last') {
-            setInterval(updateData, 30000); // 每 30 秒更新一次
+            setInterval(() => { if (!document.hidden) updateData(); }, 30000); // 每 30 秒更新一次
+            document.addEventListener('visibilitychange', () => { if (!document.hidden) updateData(); });
         }
     });
 </script>

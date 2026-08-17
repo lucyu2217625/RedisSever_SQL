@@ -28,7 +28,11 @@
                                 {{ q.name }}
                             </td>
                             <td class="py-3 px-4 text-right">
-                                <span class="{% if q.length > 20 %}text-red-600 font-bold{% else %}text-gray-900{% endif %}">
+                                {# A3：門檻與 dashboard 對齊——task_queue 超過 5 就示警（同 WARN_THRESHOLD），
+                                   其餘佇列沿用 20。後端 /queue_lengths_partial 產生的 HTML 字串
+                                   也必須套用同一規則，否則自動更新後顏色會與首次載入不一致。 #}
+                                {% set is_warn = (("task_queue" in q.name) and q.length > 5) or (q.length > 20) %}
+                                <span class="{% if is_warn %}text-red-600 font-bold{% else %}text-gray-900{% endif %}">
                                     {{ q.length }}
                                 </span>
                             </td>
@@ -67,7 +71,9 @@
     }
 
     document.addEventListener('DOMContentLoaded', () => {
-        setInterval(updateData, 5000);
+        // B3：分頁在背景時暫停輪詢，回前景立即更新一次。
+        setInterval(() => { if (!document.hidden) updateData(); }, 5000);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) updateData(); });
     });
 </script>
 {% endblock %}

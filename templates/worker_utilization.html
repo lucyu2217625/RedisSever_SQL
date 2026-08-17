@@ -188,6 +188,15 @@
         });
     }
 
+    // A4：稼動率的 worker 數量會變動，更新時重建 datasets 陣列再 update('none')，
+    // 比每次 destroy()+new 省資源、也不閃爍；legend 也一併重繪。
+    function updateChart(data) {
+        if (!myChart) { initChart(data); return; }
+        myChart.data.labels = data.labels;
+        myChart.data.datasets = buildDatasets(data.series || {});
+        myChart.update('none');
+    }
+
     async function updateData() {
         const params = new URLSearchParams(window.location.search);
         try {
@@ -196,7 +205,7 @@
             });
             const data = await response.json();
             if (data.chart_data) {
-                initChart(data.chart_data);
+                updateChart(data.chart_data);
                 document.getElementById('stat-avg-util').textContent = data.avg_utilization + '%';
                 document.getElementById('stat-worker-count').textContent = data.worker_count;
             }
@@ -212,7 +221,7 @@
         }
         const mode = document.getElementById('time_mode').value;
         if (mode === 'last') {
-            setInterval(updateData, 30000); // 每 30 秒自動更新，跟 /queue_history 頻率一致
+            (() => { setInterval(() => { if (!document.hidden) updateData(); }, 30000); document.addEventListener('visibilitychange', () => { if (!document.hidden) updateData(); }); })(); // 每 30 秒自動更新，跟 /queue_history 頻率一致
         }
     });
 </script>

@@ -616,7 +616,27 @@ def index():
 
     available_queues = ALLOWED_QUEUES
 
-    history_view = load_history_queue(queue_name, page, per_page) if queue_name else None
+    # ── 進階搜尋參數（只有 dispatched_log/failed_queue 這類 Queue 才有意義）──
+    adv_params_source = request.form if request.method == 'POST' else request.args
+    search_eqpid = adv_params_source.get('search_eqpid', '').strip()
+    search_task_id = adv_params_source.get('search_task_id', '').strip()
+    search_rpa_worker = adv_params_source.get('search_rpa_worker', '').strip()
+    search_lot_status = adv_params_source.get('search_lot_status', '').strip()
+    search_start_time = adv_params_source.get('search_start_time', '').strip()
+    search_end_time = adv_params_source.get('search_end_time', '').strip()
+    search_keyword = adv_params_source.get('search_keyword', '').strip()
+
+    search_params = {
+        'eqpid': search_eqpid,
+        'task_id': search_task_id,
+        'rpa_worker': search_rpa_worker,
+        'lot_status': search_lot_status,
+        'start_time': safe_parse_datetime(search_start_time) if search_start_time else None,
+        'end_time': safe_parse_datetime(search_end_time) if search_end_time else None,
+        'keyword': search_keyword,
+    }
+
+    history_view = load_history_queue(queue_name, page, per_page, search_params) if queue_name else None
     if history_view:
         queue_data = history_view['queue_data']
         queue_length = history_view['queue_length']
@@ -705,6 +725,13 @@ def index():
         hash_data=hash_data,
         is_history_queue=is_history_queue,
         user_role=user_role,
+        search_eqpid=search_eqpid,
+        search_task_id=search_task_id,
+        search_rpa_worker=search_rpa_worker,
+        search_lot_status=search_lot_status,
+        search_start_time=search_start_time,
+        search_end_time=search_end_time,
+        search_keyword=search_keyword,
         active_page='index'
     )
 
@@ -752,33 +779,91 @@ def normalize_history_row(row):
     }
 
 
-def load_history_queue(queue_name, page, per_page):
+def load_history_queue(queue_name, page, per_page, search_params=None):
+    """查詢 dispatched_log / failed_queue 這類歷史紀錄（存在 PostgreSQL task_history 表）。
+
+    search_params：進階搜尋條件（全部可選，沒帶就不篩選）：
+        eqpid       - payload->>'EQPID'      精準比對
+        task_id     - task_id 欄位            精準比對
+        rpa_worker  - rpa_worker 欄位         精準比對
+        lot_status  - payload->>'LotStatus'   精準比對
+        start_time  - dispatch_time >= 這個時間（datetime 物件）
+        end_time    - dispatch_time <= 這個時間（datetime 物件）
+        keyword     - 對 payload 全部內容做關鍵字模糊搜尋（不限定哪個欄位，
+                      只要 JSONB 轉成文字後包含這個字串就符合）
+    """
     category, status = history_queue_spec(queue_name)
     if not category:
         return None
 
+    search_params = search_params or {}
+    conditions = ["category = %(category)s", "status = %(status)s"]
+    params = {'category': category, 'status': status}
+
+    eqpid = (search_params.get('eqpid') or '').strip()
+    if eqpid:
+        conditions.append("payload->>'EQPID' = %(eqpid)s")
+        params['eqpid'] = eqpid
+
+    task_id = (search_params.get('task_id') or '').strip()
+    if task_id:
+        conditions.append("task_id = %(task_id)s")
+        params['task_id'] = task_id
+
+    rpa_worker = (search_params.get('rpa_worker') or '').strip()
+    if rpa_worker:
+        conditions.append("rpa_worker = %(rpa_worker)s")
+        params['rpa_worker'] = rpa_worker
+
+    lot_status = (search_params.get('lot_status') or '').strip()
+    if lot_status:
+        conditions.append("payload->>'LotStatus' = %(lot_status)s")
+        params['lot_status'] = lot_status
+
+    start_time = search_params.get('start_time')
+    if start_time:
+        conditions.append("dispatch_time >= %(start_time)s")
+        params['start_time'] = start_time
+
+    end_time = search_params.get('end_time')
+    if end_time:
+        conditions.append("dispatch_time <= %(end_time)s")
+        params['end_time'] = end_time
+
+    # 任意欄位關鍵字搜尋：把整個 payload 轉成文字後做 ILIKE 模糊比對，
+    # 不管關鍵字藏在 payload 底下哪一個欄位都能找到。
+    keyword = (search_params.get('keyword') or '').strip()
+    if keyword:
+        conditions.append("payload::text ILIKE %(keyword_pattern)s")
+        params['keyword_pattern'] = f'%{keyword}%'
+
+    where_clause = " AND ".join(conditions)
     offset = (page - 1) * per_page
+
     with pgConnect.get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """
+                f"""
                 SELECT count(*) AS cnt
                 FROM task_history
-                WHERE category = %s AND status = %s
+                WHERE {where_clause}
                 """,
-                (category, status)
+                params
             )
             total = cur.fetchone()['cnt']
 
+            query_params = dict(params)
+            query_params['limit'] = per_page
+            query_params['offset'] = offset
             cur.execute(
-                """
+                f"""
                 SELECT id, category, task_id, status, rpa_worker, dispatch_time, payload
                 FROM task_history
-                WHERE category = %s AND status = %s
+                WHERE {where_clause}
                 ORDER BY dispatch_time DESC, id DESC
-                LIMIT %s OFFSET %s
+                LIMIT %(limit)s OFFSET %(offset)s
                 """,
-                (category, status, per_page, offset)
+                query_params
             )
             rows = cur.fetchall()
 
@@ -2771,44 +2856,36 @@ def dashboard_data():
     except Exception:
         pass
 
-    # ── 3. 今日任務統計（從 dispatched_log + failed_queue 計算）──
-    categories = ["LotActions", "LineNotify", "prober"]
+    # ── 3. 今日任務統計（改成查 PostgreSQL task_history，不再讀 Redis）──
+    # 原因跟第 4 段趨勢圖一樣：history_sync 服務會持續把 Redis 的
+    # dispatched_log/failed_queue 搬到 task_history 並清空來源 list，
+    # 讀 Redis 只能看到「還沒被搬走的殘留資料」，數字會嚴重低估。
+    # 查 task_history 才是真正累計、準確的「今日」筆數。
     today_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
 
     total_dispatched_today = 0
     total_failed_today     = 0
 
-    for cat in categories:
-        for suffix, is_fail in [("dispatched_log", False), ("failed_queue", True)]:
-            keys = [f"queue_history:{cat}_{suffix}", f"{cat}_{suffix}"]
-            raw_items = []
-            for k in keys:
-                try:
-                    if redisConnect.redis_master.exists(k):
-                        raw_items = redisConnect.redis_master.lrange(k, 0, -1)
-                        if raw_items:
-                            break
-                except Exception:
-                    pass
-            for raw in raw_items:
-                try:
-                    item = json.loads(raw)
-                    if item.get("task_id") == "__INIT__":
-                        continue
-                    ts = item.get("dispatch_time") or item.get("timestamp")
-                    if not ts:
-                        continue
-                    dt = safe_parse_datetime(str(ts))
-                    if not dt: continue
-                    dt = dt.replace(tzinfo=local_tz) if dt.tzinfo is None else dt.astimezone(local_tz)
-                    if dt < today_start:
-                        continue
-                    if is_fail:
-                        total_failed_today += 1
-                    else:
-                        total_dispatched_today += 1
-                except Exception:
-                    pass
+    try:
+        with pgConnect.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT status, count(*) AS cnt
+                    FROM task_history
+                    WHERE category IN ('LotActions', 'LineNotify', 'prober')
+                      AND dispatch_time >= %s
+                    GROUP BY status
+                    """,
+                    (today_start,)
+                )
+                for status, cnt in cur.fetchall():
+                    if status == 'dispatched':
+                        total_dispatched_today += cnt
+                    elif status == 'failed':
+                        total_failed_today += cnt
+    except Exception:
+        pass
 
     # ── 4. 趨勢圖資料（使用者選擇的 category，預設 LotActions）──
     # 改成跟 /queue_history 一樣直接查 PostgreSQL task_history 表，不再讀 Redis。

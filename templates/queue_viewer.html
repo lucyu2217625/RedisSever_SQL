@@ -16,6 +16,13 @@
 {% endblock %}
 
 {% block content %}
+<!-- 隱藏的資料容器：把後端布林值用 data-* 屬性存放，供下方 script 讀取，
+     避免把 Jinja2 語法直接嵌進 JavaScript 陳述式裡（詳見下方 script 裡的說明）。 -->
+<div id="page-flags"
+     data-is-history-queue="{{ 'true' if is_history_queue else 'false' }}"
+     data-queue-name="{{ queue_name }}"
+     class="hidden"></div>
+
 <div class="flex items-center justify-between mb-4">
     <h1 class="text-lg font-semibold text-gray-800">Queue 內容查詢</h1>
     <div class="text-xs text-gray-500 font-mono bg-white px-3 py-1 rounded-full border border-gray-200">
@@ -80,6 +87,94 @@
             {% endif %}
         </form>
     </div>
+
+    <!-- 進階搜尋卡片：只有選到 _dispatched_log / _failed_queue 這類 Queue 時才顯示。
+         預設折疊，點擊標題列展開/收合；但如果使用者目前已經帶有搜尋條件
+         （代表他正在用這個功能），就自動展開，避免把使用者已設定的條件藏起來看不到。 -->
+    {% if is_history_queue %}
+    {% set has_active_search = search_eqpid or search_task_id or search_rpa_worker or search_lot_status or search_start_time or search_end_time or search_keyword %}
+    <div class="card p-4">
+        <button type="button" id="adv-search-toggle" onclick="toggleAdvancedSearch()"
+                class="w-full flex items-center justify-between text-left">
+            <span class="text-xs font-semibold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+                <i class="fas fa-filter"></i> 進階搜尋
+                {% if has_active_search %}
+                <span class="text-xs px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 font-normal normal-case">已套用篩選</span>
+                {% endif %}
+            </span>
+            <i id="adv-search-chevron" class="fas {% if has_active_search %}fa-chevron-up{% else %}fa-chevron-down{% endif %} text-gray-400 text-xs"></i>
+        </button>
+
+        <div id="adv-search-body" class="{% if not has_active_search %}hidden{% endif %} mt-3">
+        <form method="GET" action="{{ url_for('index') }}" class="space-y-3">
+            <input type="hidden" name="queue_name" value="{{ queue_name }}">
+            <input type="hidden" name="per_page" value="{{ per_page }}">
+
+            <div class="flex items-center justify-end">
+                {% if has_active_search %}
+                <a href="{{ url_for('index', queue_name=queue_name, per_page=per_page) }}" class="text-xs text-gray-400 hover:text-gray-600">
+                    <i class="fas fa-times mr-1"></i>清除所有搜尋條件
+                </a>
+                {% endif %}
+            </div>
+
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div class="flex flex-col gap-1">
+                    <label class="text-xs font-medium text-gray-500">EQPID</label>
+                    <input type="text" name="search_eqpid" value="{{ search_eqpid }}" placeholder="精準比對，如 TREXT011"
+                           class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                </div>
+                <div class="flex flex-col gap-1">
+                    <label class="text-xs font-medium text-gray-500">Task ID</label>
+                    <input type="text" name="search_task_id" value="{{ search_task_id }}" placeholder="任務 UUID"
+                           class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none font-mono">
+                </div>
+                <div class="flex flex-col gap-1">
+                    <label class="text-xs font-medium text-gray-500">RPA Worker</label>
+                    <input type="text" name="search_rpa_worker" value="{{ search_rpa_worker }}" placeholder="如 RPA_OP02"
+                           class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                </div>
+                {% if queue_name.startswith('LotActions_') or queue_name.startswith('LotAction_') %}
+                <!-- LotStatus（LotStart/LotEnd）只在 LotActions 這個 category 底下才有意義，
+                     LineNotify、prober 的 payload 裡不會有這個欄位，所以只在選到
+                     LotActions_ 開頭的 Queue 時才顯示這個篩選欄位，避免誤導使用者。 -->
+                <div class="flex flex-col gap-1">
+                    <label class="text-xs font-medium text-gray-500">LotStatus</label>
+                    <select name="search_lot_status" class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                        <option value="">-- 不限 --</option>
+                        <option value="LotStart" {% if search_lot_status == 'LotStart' %}selected{% endif %}>LotStart</option>
+                        <option value="LotEnd" {% if search_lot_status == 'LotEnd' %}selected{% endif %}>LotEnd</option>
+                    </select>
+                </div>
+                {% endif %}
+                <div class="flex flex-col gap-1">
+                    <label class="text-xs font-medium text-gray-500">開始時間</label>
+                    <input type="datetime-local" name="search_start_time" value="{{ search_start_time }}"
+                           class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                </div>
+                <div class="flex flex-col gap-1">
+                    <label class="text-xs font-medium text-gray-500">結束時間</label>
+                    <input type="datetime-local" name="search_end_time" value="{{ search_end_time }}"
+                           class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                </div>
+                <div class="flex flex-col gap-1 col-span-2">
+                    <label class="text-xs font-medium text-gray-500">
+                        關鍵字（搜尋 payload 內任意欄位）
+                    </label>
+                    <input type="text" name="search_keyword" value="{{ search_keyword }}" placeholder="例如 IP、樓層、任何內容片段..."
+                           class="text-sm border border-gray-300 rounded-md px-3 py-1.5 focus:ring-2 focus:ring-blue-400 outline-none">
+                </div>
+            </div>
+
+            <div class="flex gap-2">
+                <button type="submit" class="btn-primary btn-sm">
+                    <i class="fas fa-search mr-1"></i> 進階搜尋
+                </button>
+            </div>
+        </form>
+        </div>
+    </div>
+    {% endif %}
 
     {% if error %}
     <div class="bg-amber-50 border border-amber-200 text-amber-800 p-4 rounded-xl text-sm flex items-center gap-3">
@@ -215,7 +310,8 @@
                 </div>
                 <div class="flex items-center gap-2">
                     <label class="text-xs text-gray-500">跳至第</label>
-                    <select onchange="window.location.href='{{ url_for('index', queue_name=queue_name, per_page=per_page) }}&page=' + this.value" 
+                    <select data-base-url="{{ url_for('index', queue_name=queue_name, per_page=per_page) }}"
+                            onchange="window.location.href = this.dataset.baseUrl + '&page=' + this.value"
                             class="text-xs border border-gray-300 rounded px-2 py-1 outline-none focus:ring-1 focus:ring-blue-400 bg-white cursor-pointer">
                         {% for p in range(1, total_pages + 1) %}
                         <option value="{{ p }}" {% if p == page %}selected{% endif %}>{{ p }}</option>
@@ -320,7 +416,11 @@ function cancelDelete() {
     if (toggle) toggle.checked = false;
 }
 
-const IS_HISTORY_QUEUE = {{ 'true' if is_history_queue else 'false' }};
+// 用 #page-flags 這個隱藏元素的 data-* 屬性存放後端布林值，
+// 避免把 Jinja2 的條件輸出語法直接當成 JavaScript 陳述式的值
+// （那種寫法會讓 VS Code 的 JS 語法檢查器把原始檔案誤判成
+// 損壞的 JavaScript，報出一堆語法錯誤）。
+const IS_HISTORY_QUEUE = document.getElementById('page-flags').dataset.isHistoryQueue === 'true';
 
 function submitDeleteSelected() {
     const checkboxes = document.getElementsByName('selected_items[]');
@@ -351,10 +451,23 @@ function toggleAll(source) {
     }
 }
 
+function toggleAdvancedSearch() {
+    const body = document.getElementById('adv-search-body');
+    const chevron = document.getElementById('adv-search-chevron');
+    if (!body || !chevron) return;
+    const isHidden = body.classList.toggle('hidden');
+    // 直接切換 FontAwesome 圖示本身（向下 ↔ 向上），不依賴 CSS rotate transform，
+    // 避免因為 Tailwind build 沒包含 rotate-180 這個 utility class 而顯示不出旋轉效果。
+    chevron.classList.toggle('fa-chevron-down', isHidden);
+    chevron.classList.toggle('fa-chevron-up', !isHidden);
+}
+
 function confirmClear() {
+    // queue_name 也從 #page-flags 讀取，同樣避免 Jinja 變數直接混進 JS 樣板字串。
+    const qn = document.getElementById('page-flags').dataset.queueName;
     const msg = IS_HISTORY_QUEUE
-        ? `確定要清空「{{ queue_name }}」的全部歷史稽核紀錄嗎？此操作會永久刪除 PostgreSQL 裡的資料，無法復原。`
-        : `確定要清空整個佇列「{{ queue_name }}」嗎？此操作無法復原。`;
+        ? `確定要清空「${qn}」的全部歷史稽核紀錄嗎？此操作會永久刪除 PostgreSQL 裡的資料，無法復原。`
+        : `確定要清空整個佇列「${qn}」嗎？此操作無法復原。`;
     if (confirm(msg)) {
         document.getElementById('delete_all_force').value = '1';
         document.getElementById('delete-form').submit();

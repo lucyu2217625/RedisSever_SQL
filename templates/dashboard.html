@@ -192,6 +192,12 @@ let layoutSnapshot = null;
 let draggedLayoutItem = null;
 
 // ── 工具函數 ──────────────────────────────────────────────────
+// A2：把外部（Redis/RPA 端）字串塞進 innerHTML 前一律跳脫，避免破版或標記注入。
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[c]));
+}
 function shortName(name) {
   // LotActions_task_queue → LA_task, prober_failed_queue → PRB_failed
   return name
@@ -414,7 +420,7 @@ function renderQueueList(stats) {
       <div class="flex items-center gap-2 cursor-pointer hover:bg-gray-50 rounded px-1 py-0.5"
            onclick="window.location.href='${queueTargetUrl(s.name)}'">
         <span class="text-xs font-mono w-28 shrink-0 truncate text-gray-700"
-              title="${s.name}">${shortName(s.name)}</span>
+              title="${escapeHtml(s.name)}">${escapeHtml(shortName(s.name))}</span>
         <div class="flex-1 h-2 bg-gray-100 rounded-full overflow-hidden">
           <div class="bar-fill h-full ${barColor} rounded-full" style="width:${pct}%"></div>
         </div>
@@ -441,7 +447,7 @@ function renderWorkerGrid(workers) {
   el.innerHTML = Object.entries(workers).map(([name, status]) => `
     <div class="worker-cell rounded-lg border border-gray-200 p-2 cursor-pointer"
          onclick="window.location.href='{{ url_for('worker_status') }}'">
-      <div class="text-xs text-gray-500 truncate mb-1.5" title="${name}">${name}</div>
+      <div class="text-xs text-gray-500 truncate mb-1.5" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
       <span class="text-xs font-medium px-2 py-0.5 rounded-full ${badgeClass(status)}">
         ${badgeLabel(status)}
       </span>
@@ -547,7 +553,9 @@ document.addEventListener('DOMContentLoaded', () => {
   initDashboardDrag();
   initDashboardResize();
   refresh();
-  setInterval(refresh, REFRESH_MS);
+  // B3：分頁切到背景時暫停輪詢，回到前景立即刷新一次，省下無謂請求。
+  setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_MS);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 
   document.getElementById('category-select').addEventListener('change', refresh);
 });
